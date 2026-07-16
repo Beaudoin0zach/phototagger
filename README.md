@@ -117,7 +117,17 @@ Resume an interrupted run:
 ./phototagger.py tag --resume runs/<run-id>
 ```
 
-Restore the exact keyword lists recorded before an applied run:
+After a whole-library run completes, confirm nothing was skipped (for example
+by photos shifting position mid-run). This sweep is read-only and writes a CSV
+report of any library photos that have no record in the run:
+
+```bash
+./phototagger.py coverage --run runs/<library-run-id>
+```
+
+Restore the exact keyword lists recorded before an applied run. Rollback uses
+each photo's earliest recorded snapshot, verifies every restore by reading it
+back from Photos, and writes a `rollback-<timestamp>.jsonl` audit file:
 
 ```bash
 ./phototagger.py rollback --run runs/<run-id>
@@ -133,12 +143,21 @@ Rename generated keywords from an applied run—for example, remove an earlier
 ## Useful controls
 
 ```text
---confidence 0.65   Minimum Vision confidence (default: 0.65)
---backend ollama    Use Gemma 4 (default); use apple for Apple's classifier
---batch-size 25     Whole-library items per verified batch
+--confidence 0.65   Minimum confidence for the apple backend (default: 0.65).
+                    Ollama tags always carry confidence 1.0, so this gate only
+                    filters Apple Vision classifications.
+--backend ollama    Use Gemma 4 locally (default); apple for Apple's classifier;
+                    anthropic to use the Claude API instead (requires
+                    ANTHROPIC_API_KEY; pass --model, e.g. claude-sonnet-5).
+                    anthropic sends photos to a third-party API — a different
+                    privacy posture than the local-first ollama/apple backends.
+--batch-size 25     Whole-library items per verified batch (default: 25).
+                    With --resume it overrides the value saved in run.json.
 --order descending  Whole-library traversal direction (default: ascending)
 --model NAME        Ollama model name (default: gemma4:e4b-it-qat)
---max-tags 5        Maximum generated keywords per image (default: 5)
+--max-tags 5        Maximum descriptive tags per image (default: 5).
+                    Determination flags such as `screenshot`, `blurry`, or
+                    `identification card` are additive on top of this cap.
 --prefix "AI: "     Optional prefix for generated keywords (default: none)
 --limit 25          Process at most this many images; 0 means the full album
 --keep-exports      Retain exported image copies for troubleshooting

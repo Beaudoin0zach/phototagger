@@ -31,15 +31,21 @@ python3 -m pytest tests/           # or: python3 tests/test_phototagger.py
 - A whole-library `--apply` run is in progress and resumable:
   `runs/20260715-193432-Photos-Library/` — newest-to-oldest, batch size 2000,
   cursor at index 77,759 of 77,784.
-- **Known robustness gap:** the earlier library run crashed on `AppleEvent timed out
-  (-1712)` from Photos under sustained load. If large-batch runs keep timing out,
-  reduce `--batch-size` and/or add per-item timeout + backoff around the AppleScript calls.
+- **`-1712` timeout handling (fixed 2026-07-16):** batch inventory and post-apply
+  verification run as ≤100-item AppleScript chunks with per-call retry/backoff, so
+  a timeout retries one chunk instead of killing the batch. `--batch-size` can be
+  overridden at `--resume` time. The cursor never advances until every applied
+  item in the batch passes read-back verification — failures become retryable
+  `verify-failed` records that are reprocessed on resume. After a library run
+  completes, `./phototagger.py coverage --run runs/<id>` (read-only) reports any
+  photos with no record in the run.
 
 ## Resuming the library run
 ```bash
 cd ~/projects/phototagger
 rm -f runs/20260715-193432-Photos-Library/STOP     # required before it will proceed
-./phototagger.py tag --resume runs/20260715-193432-Photos-Library
+# saved batch size is 2000; override it at resume time (recommended after the -1712 history):
+./phototagger.py tag --resume runs/20260715-193432-Photos-Library --batch-size 200
 # or run guarded in the background:
 ./scripts/start_library_runner.sh runs/20260715-193432-Photos-Library
 ```
