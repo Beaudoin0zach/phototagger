@@ -682,6 +682,30 @@ class ResumeSafetyTests(unittest.TestCase):
             metadata = phototagger.load_run(run_dir)
             self.assertEqual(metadata["status"], "complete")
 
+    def test_consecutive_errors_trip_the_circuit_breaker(self):
+        # A hung Photos fails every AppleEvent; the batch must stop early with
+        # durable error records and saved metadata instead of grinding through
+        # hundreds of doomed items (or crashing on an unguarded read).
+        with TemporaryDirectory() as temp:
+            manifest_ids = tuple(f"p{i}" for i in range(1, 21))
+            run_dir = self._library_run_dir(temp, manifest_ids=manifest_ids)
+            with mock.patch.object(
+                phototagger, "library_count", return_value=20
+            ), mock.patch.object(
+                phototagger,
+                "library_item_by_id",
+                side_effect=RuntimeError("Photos automation timed out after 120s"),
+            ) as read_by_id:
+                result = phototagger.tag_command(self._resume_args(run_dir))
+            self.assertEqual(result, 1)
+            limit = phototagger.CONSECUTIVE_ERROR_LIMIT
+            self.assertEqual(read_by_id.call_count, limit)  # stopped early
+            records = phototagger.read_jsonl(run_dir / "results.jsonl")
+            self.assertEqual(len(records), limit)
+            self.assertTrue(all(r["status"] == "error" for r in records))
+            metadata = phototagger.load_run(run_dir)
+            self.assertEqual(metadata["status"], "batch_errors")
+
     def test_verify_phase_infrastructure_failure_saves_batch_errors_instead_of_crashing(
         self,
     ):

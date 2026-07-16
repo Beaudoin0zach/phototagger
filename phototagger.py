@@ -58,6 +58,9 @@ IMAGE_EXTENSIONS = {
 # a Photos mutation: if it is the latest record for a photo, the process died
 # mid-write and the (idempotent) write must be retried.
 RETRY_STATUSES = {"error", "verify-failed", "write-pending"}
+# A hung Photos fails every AppleEvent; stop the batch after this many
+# consecutive per-item errors instead of grinding through the rest.
+CONSECUTIVE_ERROR_LIMIT = 8
 TAG_ALIASES = {
     "cacti": "cactus",
     "house plant": "houseplant",
@@ -1430,32 +1433,21 @@ def run_tag_batch(
     persistent_exports = run_dir / "exports"
     error_count = 0
     not_found_count = 0
+    consecutive_errors = 0
     batch_records: list[dict[str, object]] = []
     for index, item in enumerate(pending, start=1):
-        if source_type == "library":
-            # Manifest entries carry no live state; re-read by id so filename
-            # and keywords reflect Photos right now (or learn the photo is gone).
-            current = library_item_by_id(item.identifier)
-            if current is None:
-                not_found_count += 1
-                append_jsonl(
-                    run_dir / "results.jsonl",
-                    {
-                        "album": album,
-                        "capture_date": item.capture_date,
-                        "filename": item.filename,
-                        "photo_id": item.identifier,
-                        "source": source_type,
-                        "status": "not-found",
-                        "timestamp": utc_now(),
-                    },
-                )
-                print(
-                    f"[{index}/{len(pending)}] {item.filename}: no longer in the library",
-                    flush=True,
-                )
-                continue
-            item = current
+        if consecutive_errors >= CONSECUTIVE_ERROR_LIMIT:
+            # Photos is almost certainly wedged (a hung app fails every
+            # subsequent AppleEvent too). Stop the batch cleanly rather than
+            # churning out hundreds of error records; everything so far is
+            # durable and the batch resumes normally once Photos recovers.
+            print(
+                f"stopping batch after {consecutive_errors} consecutive errors; "
+                "Photos may need to be reopened before resuming",
+                file=sys.stderr,
+                flush=True,
+            )
+            break
         print(f"[{index}/{len(pending)}] {item.filename}", flush=True)
         record: dict[str, object] = {
             "album": album,
@@ -1468,6 +1460,22 @@ def run_tag_batch(
             "timestamp": utc_now(),
         }
         try:
+            if source_type == "library":
+                # Manifest entries carry no live state; re-read by id so
+                # filename and keywords reflect Photos right now (or learn
+                # the photo is gone). Inside the try so a Photos hiccup on
+                # the read becomes a retryable per-item error, not a crash.
+                current = library_item_by_id(item.identifier)
+                if current is None:
+                    raise PhotoNotFoundError(item.identifier)
+                item = current
+                record.update(
+                    {
+                        "filename": item.filename,
+                        "keywords_before": item.keywords,
+                        "capture_date": item.capture_date or record["capture_date"],
+                    }
+                )
             if Path(item.filename).suffix.casefold() not in IMAGE_EXTENSIONS:
                 record.update(
                     {
@@ -1574,12 +1582,16 @@ def run_tag_batch(
                     )
         except PhotoNotFoundError:
             not_found_count += 1
+            consecutive_errors = 0  # Photos responded; the photo is just gone
             record.update({"status": "not-found"})
             print("  photo no longer in the library", flush=True)
         except Exception as error:  # continue so one iCloud/export failure does not lose the run
             error_count += 1
+            consecutive_errors += 1
             record.update({"error": str(error), "status": "error"})
             print(f"  ERROR: {error}", file=sys.stderr)
+        else:
+            consecutive_errors = 0
         record["timestamp"] = utc_now()
         append_jsonl(run_dir / "results.jsonl", record)
         batch_records.append(record)
