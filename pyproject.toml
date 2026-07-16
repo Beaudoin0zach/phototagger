@@ -1,0 +1,18 @@
+[project]
+name = "phototagger"
+version = "0.1.0"
+description = "Local-first macOS CLI that classifies Apple Photos images and optionally writes labels back as Photos keywords."
+readme = "README.md"
+requires-python = ">=3.10"
+# No third-party Python packages are required (standard library only).
+# External runtime dependencies are system tools, not pip installs:
+#   - macOS with Photos.app and Apple command-line developer tools (swiftc)
+#   - ImageMagick (`magick`) for HEIC decoding / auto-orientation
+#   - Ollama with the `gemma4:e4b-it-qat` model (recommended backend)
+dependencies = []
+
+[project.scripts]
+phototagger = "phototagger:main"
+
+[tool.setuptools]
+py-modules = ["phototagger"]
