@@ -961,33 +961,39 @@ class InfrastructureTests(unittest.TestCase):
             entries = phototagger.load_manifest(run_dir)
             self.assertEqual([entry["photo_id"] for entry in entries], ["a", "b", "c"])
 
-    def test_build_manifest_resumes_partial_sweep(self):
+    def test_build_manifest_bulk_orders_and_replaces_stale_partial(self):
+        FS, RS = "\x1e", "\x1d"
+        bulk = RS.join(
+            [
+                f"id1{FS}a.jpg{FS}Jan 1",
+                f"id2{FS}b.jpg{FS}Jan 2",
+                f"id3{FS}c.jpg{FS}Jan 3",
+            ]
+        )
         with TemporaryDirectory() as temp:
             run_dir = Path(temp)
-            # A previous build already swept indexes 1-100.
-            for index in range(1, 101):
-                phototagger.append_jsonl(
-                    run_dir / "manifest.jsonl",
-                    {"photo_id": f"id{index}", "swept_index": index},
-                )
-            calls = []
-
-            def fake_inventory(start, count, order="ascending", timeout=1800):
-                calls.append((start, count))
-                return [
-                    make_item(f"id{start + offset}", source_index=start + offset)
-                    for offset in range(count)
-                    if start + offset <= 150
-                ]
-
+            # A stale partial manifest from an interrupted build must be
+            # replaced wholesale, not appended to.
+            phototagger.append_jsonl(run_dir / "manifest.jsonl", {"photo_id": "stale"})
             with mock.patch.object(
-                phototagger, "library_count", return_value=150
-            ), mock.patch.object(
-                phototagger, "inventory_library_batch", side_effect=fake_inventory
+                phototagger, "run_applescript", return_value=bulk
             ):
-                total = phototagger.build_manifest(run_dir, "ascending")
-            self.assertEqual(calls[0][0], 101)  # resumed, not restarted
-            self.assertEqual(total, 150)
+                total = phototagger.build_manifest(run_dir, "descending")
+            self.assertEqual(total, 3)
+            entries = phototagger.load_manifest(run_dir)
+            self.assertEqual(
+                [entry["photo_id"] for entry in entries], ["id3", "id2", "id1"]
+            )
+            self.assertEqual(entries[0]["filename"], "c.jpg")
+            self.assertFalse((run_dir / "manifest.jsonl.tmp").exists())
+            with mock.patch.object(
+                phototagger, "run_applescript", return_value=bulk
+            ):
+                phototagger.build_manifest(run_dir, "ascending")
+            entries = phototagger.load_manifest(run_dir)
+            self.assertEqual(
+                [entry["photo_id"] for entry in entries], ["id1", "id2", "id3"]
+            )
 
     def test_resolve_model_defaults_and_validation(self):
         self.assertEqual(phototagger.resolve_model("ollama", None), "gemma4:e4b-it-qat")

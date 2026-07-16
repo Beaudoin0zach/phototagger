@@ -1158,45 +1158,42 @@ def load_manifest(run_dir: Path) -> list[dict[str, object]]:
     return entries
 
 
-def build_manifest(run_dir: Path, order: str, chunk_size: int = 100) -> int:
-    """One full positional sweep capturing every photo id into manifest.jsonl.
+def build_manifest(run_dir: Path, order: str) -> int:
+    """Capture every photo id into manifest.jsonl via one bulk fetch.
 
-    This is the only remaining positional traversal; everything afterwards is
-    addressed purely by photo id, so library growth/shrinkage between batches
-    can no longer skew which photos get processed. Appends chunk-by-chunk and
-    resumes a partial build from the last recorded position.
+    Positional per-item reads cost O(index) each, making a full positional
+    sweep O(n^2) — measured at ~78 hours for a 78k library. The bulk
+    AppleScript fetches the whole id/filename/date lists as three Apple
+    events and returns in minutes. Everything after this build is addressed
+    purely by photo id, so library growth/shrinkage between batches can no
+    longer skew which photos get processed. Written atomically (temp+rename),
+    replacing any stale partial manifest.
     """
-    manifest_path = run_dir / "manifest.jsonl"
-    existing = read_jsonl(manifest_path)
-    total = library_count()
+    if order not in {"ascending", "descending"}:
+        raise RuntimeError("library order must be ascending or descending")
+    output = run_applescript("library_manifest_bulk.applescript", timeout=1800)
+    entries: list[dict[str, object]] = []
+    for row in output.split(ROW_SEPARATOR) if output else []:
+        fields = row.split(FIELD_SEPARATOR)
+        if len(fields) != 3:
+            raise RuntimeError("Photos returned an unexpected manifest row")
+        photo_id, filename, capture_date = fields
+        entries.append(
+            {
+                "capture_date": capture_date,
+                "filename": filename,
+                "photo_id": photo_id,
+            }
+        )
     if order == "descending":
-        start = total
-        if existing:
-            start = int(existing[-1].get("swept_index", total)) - 1
-    else:
-        start = 1
-        if existing:
-            start = int(existing[-1].get("swept_index", 0)) + 1
-    swept = len(existing)
-    while (order == "descending" and start >= 1) or (order == "ascending" and start <= total):
-        count = min(chunk_size, start if order == "descending" else total - start + 1)
-        chunk = inventory_library_batch(start, count, order, timeout=600)
-        if not chunk:
-            break
-        for item in chunk:
-            append_jsonl(
-                manifest_path,
-                {
-                    "capture_date": item.capture_date,
-                    "filename": item.filename,
-                    "photo_id": item.identifier,
-                    "swept_index": item.source_index,
-                },
-            )
-        swept += len(chunk)
-        start = library_next_index(start, count, order)
-        if swept % 2000 < chunk_size:
-            print(f"manifest: {swept} photos recorded", flush=True)
+        entries.reverse()
+    temp = run_dir / "manifest.jsonl.tmp"
+    with temp.open("w", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temp.replace(run_dir / "manifest.jsonl")
     return len(load_manifest(run_dir))
 
 
@@ -1327,7 +1324,9 @@ def run_tag_batch(
     if source_type == "library":
         if library_order not in {"ascending", "descending"}:
             raise RuntimeError(f"unknown saved library order: {library_order!r}")
-        if "next_index" in metadata and not (run_dir / "manifest.jsonl").exists():
+        if "next_index" in metadata:
+            # Keyed on the retired cursor field, not on manifest.jsonl existing:
+            # an interrupted migration can leave a stale partial manifest behind.
             raise RuntimeError(
                 "this run predates id-based traversal; migrate it first: "
                 f"python3 scripts/migrate_run_to_manifest.py {run_dir}"

@@ -42,8 +42,7 @@ def main() -> int:
 
     with pt.run_lock(run_dir):
         order = str(metadata.get("order", "ascending"))
-        print(f"Building manifest with one full {order} library sweep")
-        print("(safe to interrupt; re-running resumes the sweep)")
+        print(f"Building the {order} manifest via one bulk fetch (a few minutes)")
         manifest_total = pt.build_manifest(run_dir, order)
 
         # Records already in results.jsonl stay authoritative regardless of
