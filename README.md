@@ -84,8 +84,12 @@ Tag the whole album only after the small test succeeds:
 ./phototagger.py tag --album "House plants" --limit 0 --apply
 ```
 
-Start a resumable 25-item whole-library run. Each invocation processes one batch,
-verifies Photos read-back, and advances the saved cursor only after success:
+Start a resumable whole-library run. The first invocation performs a one-time
+full sweep that records every photo's id into `manifest.jsonl`; from then on
+every read and write is addressed purely by photo id, so the run is unaffected
+by the library growing, shrinking, or reordering mid-run (for example from
+background duplicate merging). Each invocation processes one batch and verifies
+every applied photo by read-back before it counts as done:
 
 ```bash
 ./phototagger.py tag --library --batch-size 25 --order descending --apply
@@ -94,17 +98,29 @@ verifies Photos read-back, and advances the saved cursor only after success:
 
 Use `--order descending` for newest-to-oldest or `--order ascending` for
 oldest-to-newest. Each batch CSV records the capture date. Transient AppleEvent
-timeouts are retried automatically.
+timeouts and dropped Photos connections are retried automatically. Photos that
+were deleted after the manifest was built are recorded as `not-found` and
+skipped cleanly. Every keyword write journals its intent durably before
+touching Photos and only ever *adds* missing keywords, so keywords you add by
+hand in Photos.app mid-run are never overwritten.
 
-Change an existing stopped whole-library run to newest-to-oldest while preserving
-its prior results:
+A run created before manifest traversal must be migrated once before it can
+resume:
+
+```bash
+python3 scripts/migrate_run_to_manifest.py runs/<library-run-id>
+```
+
+Change a stopped whole-library run to newest-to-oldest while preserving its
+prior results (this reverses the manifest traversal order):
 
 ```bash
 ./phototagger.py set-library-order --run runs/<library-run-id> --order descending
 ```
 
 For a large library, the guarded runner can continue batches in the background.
-It stops on any error, a change in the Photos library count, or a `STOP` file:
+It stops on any error or a `STOP` file; every mutating command also takes a
+per-run lock, so two commands can never write the same run concurrently:
 
 ```bash
 ./scripts/start_library_runner.sh runs/<library-run-id>
@@ -117,17 +133,19 @@ Resume an interrupted run:
 ./phototagger.py tag --resume runs/<run-id>
 ```
 
-After a whole-library run completes, confirm nothing was skipped (for example
-by photos shifting position mid-run). This sweep is read-only and writes a CSV
-report of any library photos that have no record in the run:
+After a whole-library run completes, confirm nothing was skipped. For a
+manifest run this is a pure local diff (instant, no Photos access) reporting
+any manifest photo with no record; it writes a CSV report:
 
 ```bash
 ./phototagger.py coverage --run runs/<library-run-id>
 ```
 
-Restore the exact keyword lists recorded before an applied run. Rollback uses
-each photo's earliest recorded snapshot, verifies every restore by reading it
-back from Photos, and writes a `rollback-<timestamp>.jsonl` audit file:
+Undo an applied run. Rollback surgically removes exactly the keywords this run
+generated (union across every write attempt, case-insensitive), leaving all
+other keywords — including anything you added by hand since — untouched. Each
+removal is confirmed by read-back and logged to a `rollback-<timestamp>.jsonl`
+audit file:
 
 ```bash
 ./phototagger.py rollback --run runs/<run-id>
@@ -154,7 +172,8 @@ Rename generated keywords from an applied run—for example, remove an earlier
 --batch-size 25     Whole-library items per verified batch (default: 25).
                     With --resume it overrides the value saved in run.json.
 --order descending  Whole-library traversal direction (default: ascending)
---model NAME        Ollama model name (default: gemma4:e4b-it-qat)
+--model NAME        Vision model. Defaults to gemma4:e4b-it-qat for the ollama
+                    backend; required explicitly for anthropic.
 --max-tags 5        Maximum descriptive tags per image (default: 5).
                     Determination flags such as `screenshot`, `blurry`, or
                     `identification card` are additive on top of this cap.
@@ -180,9 +199,12 @@ fixed classification vocabulary is more generic.
 
 Each run directory contains:
 
-- `run.json` — settings and progress metadata;
-- `results.jsonl` — one durable record per attempted photo;
-- `review.csv` — human-readable predictions and statuses;
+- `run.json` — settings and progress metadata (written atomically);
+- `results.jsonl` — one durable record per attempt, including `write-pending`
+  journal entries appended before every Photos mutation;
+- `manifest.jsonl` — whole-library runs only: the fixed photo-id worklist;
+- `review.csv` / `batches/*.csv` — human-readable predictions and statuses;
+- `command.lock` / `runner.lock` — concurrency locks;
 - `exports/` — present only with `--keep-exports`.
 
 Do not commit run directories containing private filenames or Photos identifiers.

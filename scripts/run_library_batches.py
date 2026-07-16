@@ -35,11 +35,10 @@ def main() -> int:
         if metadata.get("status") == "complete":
             print(f"{datetime.now().isoformat()} whole-library run complete", flush=True)
             return 0
-        next_index = int(metadata.get("next_index", 1))
-        total_count = int(metadata.get("total_count", 0))
+        manifest_total = int(metadata.get("manifest_total", 0))
         print(
-            f"{datetime.now().isoformat()} starting batch at index {next_index} "
-            f"of {total_count}",
+            f"{datetime.now().isoformat()} starting next batch "
+            f"({manifest_total} photos in manifest)",
             flush=True,
         )
         result = subprocess.run(

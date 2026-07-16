@@ -339,7 +339,16 @@ class ResumeSafetyTests(unittest.TestCase):
         pending = phototagger.pending_items(items, latest)
         self.assertEqual([item.identifier for item in pending], ["b", "c", "d"])
 
-    def test_verify_applied_batch_logs_mismatch_as_retryable(self):
+    def test_pending_items_retries_write_pending_and_skips_not_found(self):
+        items = [make_item("a"), make_item("b")]
+        latest = {
+            "a": {"photo_id": "a", "status": "write-pending"},
+            "b": {"photo_id": "b", "status": "not-found"},
+        }
+        pending = phototagger.pending_items(items, latest)
+        self.assertEqual([item.identifier for item in pending], ["a"])
+
+    def test_verify_applied_batch_logs_missing_generated_tags_as_retryable(self):
         with TemporaryDirectory() as temp:
             run_dir = Path(temp)
             records = {
@@ -347,14 +356,14 @@ class ResumeSafetyTests(unittest.TestCase):
                     "photo_id": "a",
                     "filename": "a.jpg",
                     "status": "applied",
-                    "keywords_before": ["Family"],
+                    "generated_keywords": ["plant"],
                     "keywords_after": ["Family", "plant"],
                 },
                 "b": {
                     "photo_id": "b",
                     "filename": "b.jpg",
                     "status": "applied",
-                    "keywords_before": [],
+                    "generated_keywords": ["plant"],
                     "keywords_after": ["plant"],
                 },
             }
@@ -368,8 +377,28 @@ class ResumeSafetyTests(unittest.TestCase):
             self.assertEqual(len(appended), 1)
             self.assertEqual(appended[0]["photo_id"], "b")
             self.assertEqual(appended[0]["status"], "verify-failed")
-            self.assertEqual(appended[0]["keywords_expected"], ["plant"])
-            self.assertEqual(appended[0]["keywords_found"], [])
+
+    def test_verify_applied_batch_tolerates_concurrent_manual_keywords(self):
+        # A user adding/removing their own keywords in Photos.app mid-run must
+        # never count as a verification failure — only OUR generated tags
+        # going missing does.
+        with TemporaryDirectory() as temp:
+            run_dir = Path(temp)
+            records = {
+                "a": {
+                    "photo_id": "a",
+                    "status": "applied",
+                    "generated_keywords": ["plant"],
+                    "keywords_after": ["old-manual", "plant"],
+                }
+            }
+            current = [
+                # user removed "old-manual" and added "vacation" since the write
+                make_item("a", keywords=["plant", "vacation"])
+            ]
+            failures = phototagger.verify_applied_batch(run_dir, current, records)
+            self.assertEqual(failures, 0)
+            self.assertFalse((run_dir / "results.jsonl").exists())
 
     def test_verify_applied_batch_counts_missing_photo(self):
         with TemporaryDirectory() as temp:
@@ -379,30 +408,22 @@ class ResumeSafetyTests(unittest.TestCase):
                     "photo_id": "gone",
                     "filename": "gone.jpg",
                     "status": "applied",
-                    "keywords_before": [],
+                    "generated_keywords": ["plant"],
                     "keywords_after": ["plant"],
                 }
             }
             failures = phototagger.verify_applied_batch(run_dir, [], records)
             self.assertEqual(failures, 1)
 
-    def test_verify_applied_batch_passes_clean_batch(self):
-        with TemporaryDirectory() as temp:
-            run_dir = Path(temp)
-            records = {
-                "a": {
-                    "photo_id": "a",
-                    "status": "applied",
-                    "keywords_after": ["plant"],
-                },
-                "b": {"photo_id": "b", "status": "review"},
-            }
-            current = [make_item("a", keywords=["plant"]), make_item("b")]
-            failures = phototagger.verify_applied_batch(run_dir, current, records)
-            self.assertEqual(failures, 0)
-            self.assertFalse((run_dir / "results.jsonl").exists())
-
-    def _library_run_dir(self, temp, *, next_index=1, total_count=1, batch_size=25):
+    def _library_run_dir(
+        self,
+        temp,
+        *,
+        batch_size=25,
+        status="batch_complete",
+        manifest_ids=("p1",),
+        extra_metadata=None,
+    ):
         run_dir = Path(temp) / "run"
         run_dir.mkdir()
         metadata = {
@@ -415,144 +436,288 @@ class ResumeSafetyTests(unittest.TestCase):
             "limit": 0,
             "max_tags": 5,
             "model": "gemma4:test",
-            "next_index": next_index,
             "order": "ascending",
             "prefix": "",
             "source": "library",
-            "status": "batch_errors",
-            "total_count": total_count,
-            "version": 4,
+            "status": status,
+            "version": 5,
         }
+        if extra_metadata:
+            metadata.update(extra_metadata)
         phototagger.save_run(run_dir, metadata)
+        for photo_id in manifest_ids:
+            phototagger.append_jsonl(
+                run_dir / "manifest.jsonl",
+                {
+                    "capture_date": "",
+                    "filename": f"{photo_id}.jpg",
+                    "photo_id": photo_id,
+                    "swept_index": 1,
+                },
+            )
         return run_dir
 
     def _resume_args(self, run_dir, batch_size=None):
         return argparse.Namespace(resume=str(run_dir), batch_size=batch_size)
 
-    def test_resume_with_empty_pending_does_not_advance_past_failed_verify(self):
+    def _classify_result(self):
+        return {
+            "classifications": [{"label": "plant", "confidence": 1.0}],
+            "determinations": {},
+        }
+
+    def test_write_ahead_journal_precedes_the_photos_write(self):
         with TemporaryDirectory() as temp:
             run_dir = self._library_run_dir(temp)
-            # Photo recorded as applied, but Photos never persisted the write.
+            with mock.patch.object(
+                phototagger, "library_count", return_value=1
+            ), mock.patch.object(
+                phototagger,
+                "library_item_by_id",
+                side_effect=[
+                    make_item("p1", keywords=["Family"]),  # batch read
+                    make_item("p1", keywords=["Family", "plant"]),  # verify read
+                ],
+            ), mock.patch.object(
+                phototagger,
+                "export_library_photo_by_id",
+                return_value=Path("/tmp/fake.jpg"),
+            ), mock.patch.object(
+                phototagger, "classify", return_value=self._classify_result()
+            ), mock.patch.object(
+                phototagger,
+                "sync_library_keywords",
+                return_value=(["Family"], ["Family", "plant"]),
+            ) as sync:
+                result = phototagger.tag_command(self._resume_args(run_dir))
+            self.assertEqual(result, 0)
+            sync.assert_called_once_with("p1", ["plant"])
+            records = phototagger.read_jsonl(run_dir / "results.jsonl")
+            statuses = [record["status"] for record in records]
+            # The journal entry lands durably BEFORE the mutation's record.
+            self.assertEqual(statuses, ["write-pending", "applied"])
+            # keywords_before comes from the sync's atomic read, not the
+            # inventory-time snapshot.
+            self.assertEqual(records[1]["keywords_before"], ["Family"])
+            self.assertEqual(records[1]["keywords_after"], ["Family", "plant"])
+            metadata = phototagger.load_run(run_dir)
+            self.assertEqual(metadata["status"], "complete")
+            self.assertTrue(metadata["last_batch_verified"])
+
+    def test_interrupted_write_pending_record_is_retried_on_resume(self):
+        with TemporaryDirectory() as temp:
+            run_dir = self._library_run_dir(temp)
+            # Crash happened between the journal entry and the applied record;
+            # the (idempotent) write must be retried on resume.
             phototagger.append_jsonl(
                 run_dir / "results.jsonl",
                 {
                     "photo_id": "p1",
                     "filename": "p1.jpg",
-                    "status": "applied",
-                    "keywords_before": [],
-                    "keywords_after": ["plant"],
+                    "generated_keywords": ["plant"],
+                    "status": "write-pending",
                     "source": "library",
-                    "source_index": 1,
                 },
             )
-            inventory = [make_item("p1", keywords=[], source_index=1)]
-            with mock.patch.object(phototagger, "library_count", return_value=1), \
-                    mock.patch.object(
-                        phototagger,
-                        "inventory_library_batch_chunked",
-                        return_value=inventory,
-                    ):
+            with mock.patch.object(
+                phototagger, "library_count", return_value=1
+            ), mock.patch.object(
+                phototagger,
+                "library_item_by_id",
+                side_effect=[
+                    make_item("p1", keywords=["Family", "plant"]),  # batch read
+                    make_item("p1", keywords=["Family", "plant"]),  # verify read
+                ],
+            ), mock.patch.object(
+                phototagger,
+                "export_library_photo_by_id",
+                return_value=Path("/tmp/fake.jpg"),
+            ), mock.patch.object(
+                phototagger, "classify", return_value=self._classify_result()
+            ), mock.patch.object(
+                phototagger,
+                "sync_library_keywords",
+                return_value=(["Family", "plant"], ["Family", "plant"]),
+            ) as sync:
                 result = phototagger.tag_command(self._resume_args(run_dir))
-            self.assertEqual(result, 1)
-            metadata = phototagger.load_run(run_dir)
-            self.assertEqual(metadata["status"], "batch_errors")
-            self.assertEqual(metadata["next_index"], 1)  # cursor did NOT advance
+            self.assertEqual(result, 0)
+            sync.assert_called_once()  # retried, and safely idempotent
             latest = phototagger.latest_records_by_photo(
                 phototagger.read_jsonl(run_dir / "results.jsonl")
             )
-            self.assertEqual(latest["p1"]["status"], "verify-failed")
+            self.assertEqual(latest["p1"]["status"], "applied")
 
-    def test_resume_with_empty_pending_advances_after_clean_verify(self):
+    def test_errored_batch_is_reverified_on_resume(self):
         with TemporaryDirectory() as temp:
-            run_dir = self._library_run_dir(temp)
+            run_dir = self._library_run_dir(
+                temp,
+                status="batch_errors",
+                extra_metadata={"last_batch_photo_ids": ["p1"]},
+            )
+            # Recorded applied, but Photos does not actually hold the tag.
             phototagger.append_jsonl(
                 run_dir / "results.jsonl",
                 {
                     "photo_id": "p1",
                     "filename": "p1.jpg",
-                    "status": "applied",
-                    "keywords_before": [],
+                    "generated_keywords": ["plant"],
                     "keywords_after": ["plant"],
+                    "status": "applied",
                     "source": "library",
-                    "source_index": 1,
                 },
             )
-            inventory = [make_item("p1", keywords=["plant"], source_index=1)]
-            with mock.patch.object(phototagger, "library_count", return_value=1), \
-                    mock.patch.object(
-                        phototagger,
-                        "inventory_library_batch_chunked",
-                        return_value=inventory,
-                    ):
+            with mock.patch.object(
+                phototagger, "library_count", return_value=1
+            ), mock.patch.object(
+                phototagger,
+                "library_item_by_id",
+                side_effect=[
+                    make_item("p1", keywords=[]),  # re-verify read: tag missing
+                    make_item("p1", keywords=[]),  # batch read for reprocess
+                    make_item("p1", keywords=["plant"]),  # verify read after re-apply
+                ],
+            ), mock.patch.object(
+                phototagger,
+                "export_library_photo_by_id",
+                return_value=Path("/tmp/fake.jpg"),
+            ), mock.patch.object(
+                phototagger, "classify", return_value=self._classify_result()
+            ), mock.patch.object(
+                phototagger,
+                "sync_library_keywords",
+                return_value=([], ["plant"]),
+            ) as sync:
                 result = phototagger.tag_command(self._resume_args(run_dir))
             self.assertEqual(result, 0)
+            sync.assert_called_once()  # the unconfirmed write was redone
+            statuses = [
+                record["status"]
+                for record in phototagger.read_jsonl(run_dir / "results.jsonl")
+            ]
+            self.assertEqual(
+                statuses, ["applied", "verify-failed", "write-pending", "applied"]
+            )
             metadata = phototagger.load_run(run_dir)
             self.assertEqual(metadata["status"], "complete")
-            self.assertEqual(metadata["next_index"], 2)
-            self.assertTrue(metadata["last_batch_verified"])
 
-    def test_resume_batch_size_override_is_persisted(self):
+    def test_resume_batch_size_override_limits_batch_and_persists(self):
         with TemporaryDirectory() as temp:
-            run_dir = self._library_run_dir(temp, batch_size=2000)
-            phototagger.append_jsonl(
-                run_dir / "results.jsonl",
+            run_dir = self._library_run_dir(
+                temp, batch_size=2000, manifest_ids=("p1", "p2", "p3")
+            )
+            seen: set = set()
+
+            def read_by_id(pid):
+                # First read (batch) has no tag yet; verify read sees it applied.
+                if pid in seen:
+                    return make_item(pid, keywords=["plant"])
+                seen.add(pid)
+                return make_item(pid, keywords=[])
+
+            with mock.patch.object(
+                phototagger, "library_count", return_value=3
+            ), mock.patch.object(
+                phototagger,
+                "library_item_by_id",
+                side_effect=read_by_id,
+            ), mock.patch.object(
+                phototagger,
+                "export_library_photo_by_id",
+                return_value=Path("/tmp/fake.jpg"),
+            ), mock.patch.object(
+                phototagger, "classify", return_value=self._classify_result()
+            ), mock.patch.object(
+                phototagger,
+                "sync_library_keywords",
+                return_value=([], ["plant"]),
+            ) as sync:
+                result = phototagger.tag_command(self._resume_args(run_dir, batch_size=2))
+            self.assertEqual(result, 0)
+            self.assertEqual(sync.call_count, 2)  # only the batch, not all 3
+            metadata = phototagger.load_run(run_dir)
+            self.assertEqual(metadata["batch_size"], 2)
+            self.assertEqual(metadata["status"], "batch_complete")  # p3 remains
+
+    def test_old_positional_run_requires_migration(self):
+        with TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "run"
+            run_dir.mkdir()
+            phototagger.save_run(
+                run_dir,
                 {
-                    "photo_id": "p1",
-                    "filename": "p1.jpg",
-                    "status": "applied",
-                    "keywords_before": [],
-                    "keywords_after": ["plant"],
+                    "album": "Photos Library",
+                    "apply": True,
+                    "batch_size": 25,
+                    "confidence": 0.65,
+                    "keep_exports": False,
+                    "limit": 0,
+                    "max_tags": 5,
+                    "model": "gemma4:test",
+                    "next_index": 77759,
+                    "order": "descending",
+                    "prefix": "",
                     "source": "library",
-                    "source_index": 1,
+                    "status": "batch_complete",
+                    "total_count": 77784,
+                    "version": 4,
                 },
             )
-            inventory = [make_item("p1", keywords=["plant"], source_index=1)]
-            with mock.patch.object(phototagger, "library_count", return_value=1), \
-                    mock.patch.object(
-                        phototagger,
-                        "inventory_library_batch_chunked",
-                        return_value=inventory,
-                    ) as chunked:
-                phototagger.tag_command(self._resume_args(run_dir, batch_size=200))
-            self.assertEqual(chunked.call_args_list[0].args[1], 200)
+            with self.assertRaisesRegex(RuntimeError, "migrate_run_to_manifest"):
+                phototagger.tag_command(self._resume_args(run_dir))
+
+    def test_deleted_photo_is_recorded_as_terminal_not_found(self):
+        with TemporaryDirectory() as temp:
+            run_dir = self._library_run_dir(temp)
+            with mock.patch.object(
+                phototagger, "library_count", return_value=0
+            ), mock.patch.object(
+                phototagger, "library_item_by_id", return_value=None
+            ):
+                result = phototagger.tag_command(self._resume_args(run_dir))
+            self.assertEqual(result, 0)  # a vanished photo is not an error
+            latest = phototagger.latest_records_by_photo(
+                phototagger.read_jsonl(run_dir / "results.jsonl")
+            )
+            self.assertEqual(latest["p1"]["status"], "not-found")
             metadata = phototagger.load_run(run_dir)
-            self.assertEqual(metadata["batch_size"], 200)
+            self.assertEqual(metadata["status"], "complete")
 
     def test_verify_phase_infrastructure_failure_saves_batch_errors_instead_of_crashing(
         self,
     ):
-        # Regression test: a real production run hit "Connection is invalid
-        # (-609)" from the post-write verification re-inventory call. That
-        # call wasn't wrapped in error handling, so the whole invocation
-        # crashed before save_run — losing this attempt's bookkeeping even
-        # though every per-item result was already durable in results.jsonl.
+        # Regression: a real production run died on "Connection is invalid
+        # (-609)" raised by the post-write verification pass, crashing before
+        # save_run. Verification infrastructure failures must degrade to
+        # batch_errors with metadata still persisted.
         with TemporaryDirectory() as temp:
-            run_dir = self._library_run_dir(temp, next_index=5, total_count=5)
-            pending_item = make_item("p1", keywords=[], source_index=5)
+            run_dir = self._library_run_dir(temp)
             with mock.patch.object(
-                phototagger, "library_count", return_value=5
+                phototagger, "library_count", return_value=1
             ), mock.patch.object(
                 phototagger,
-                "inventory_library_batch_chunked",
+                "library_item_by_id",
                 side_effect=[
-                    [pending_item],
-                    RuntimeError("Photos automation failed: Connection is invalid. (-609)"),
+                    make_item("p1", keywords=[]),  # batch read
+                    RuntimeError(
+                        "Photos automation failed: Connection is invalid. (-609)"
+                    ),  # verify read
                 ],
             ), mock.patch.object(
-                phototagger, "export_library_photo", return_value=Path("/tmp/fake.jpg")
+                phototagger,
+                "export_library_photo_by_id",
+                return_value=Path("/tmp/fake.jpg"),
+            ), mock.patch.object(
+                phototagger, "classify", return_value=self._classify_result()
             ), mock.patch.object(
                 phototagger,
-                "classify",
-                return_value={
-                    "classifications": [{"label": "plant", "confidence": 1.0}],
-                    "determinations": {},
-                },
-            ), mock.patch.object(phototagger, "set_library_keywords"):
+                "sync_library_keywords",
+                return_value=([], ["plant"]),
+            ):
                 result = phototagger.tag_command(self._resume_args(run_dir))
             self.assertEqual(result, 1)
             metadata = phototagger.load_run(run_dir)
             self.assertEqual(metadata["status"], "batch_errors")
-            self.assertEqual(metadata["next_index"], 5)  # cursor did NOT advance
+            self.assertEqual(metadata["last_batch_photo_ids"], ["p1"])
             # The write itself is durable even though verification couldn't confirm it.
             latest = phototagger.latest_records_by_photo(
                 phototagger.read_jsonl(run_dir / "results.jsonl")
@@ -650,86 +815,227 @@ class AppleScriptRetryTests(unittest.TestCase):
 
 
 class RollbackTests(unittest.TestCase):
-    def test_rollback_restores_earliest_snapshot_and_verifies(self):
-        with TemporaryDirectory() as temp:
-            run_dir = Path(temp) / "run"
-            run_dir.mkdir()
-            phototagger.save_run(
-                run_dir, {"album": "Plants", "apply": True, "source": "album"}
-            )
-            # Two applied records for one photo: retry after a verify failure.
-            # Only the FIRST snapshot holds the true pre-run keywords.
-            phototagger.append_jsonl(
-                run_dir / "results.jsonl",
-                {
-                    "photo_id": "p1",
-                    "filename": "p1.jpg",
-                    "status": "applied",
-                    "keywords_before": ["Family"],
-                    "keywords_after": ["Family", "plant"],
-                },
-            )
-            phototagger.append_jsonl(
-                run_dir / "results.jsonl",
-                {
-                    "photo_id": "p1",
-                    "filename": "p1.jpg",
-                    "status": "applied",
-                    "keywords_before": ["Family", "plant"],
-                    "keywords_after": ["Family", "plant"],
-                },
-            )
-            restored_calls = []
+    def _library_run(self, temp):
+        run_dir = Path(temp) / "run"
+        run_dir.mkdir()
+        phototagger.save_run(
+            run_dir, {"album": "Photos Library", "apply": True, "source": "library"}
+        )
+        return run_dir
 
-            def fake_set_keywords(album, photo_id, keywords):
-                restored_calls.append((album, photo_id, keywords))
+    def test_generated_tags_union_covers_applied_and_write_pending(self):
+        records = [
+            {"photo_id": "p1", "status": "applied", "generated_keywords": ["plant"]},
+            # A crashed write attempt still counts — the write may have landed.
+            {"photo_id": "p1", "status": "write-pending", "generated_keywords": ["Leaf"]},
+            {"photo_id": "p1", "status": "applied", "generated_keywords": ["leaf", "pot"]},
+            {"photo_id": "p2", "status": "review", "generated_keywords": ["ignored"]},
+            {"photo_id": "p3", "status": "applied", "generated_keywords": []},
+        ]
+        union = phototagger.generated_tags_by_photo(records)
+        self.assertEqual(set(union), {"p1"})
+        self.assertEqual(union["p1"]["generated_keywords"], ["plant", "Leaf", "pot"])
+
+    def test_rollback_surgically_removes_only_generated_tags(self):
+        with TemporaryDirectory() as temp:
+            run_dir = self._library_run(temp)
+            phototagger.append_jsonl(
+                run_dir / "results.jsonl",
+                {
+                    "photo_id": "p1",
+                    "filename": "p1.jpg",
+                    "status": "applied",
+                    "generated_keywords": ["plant", "leaf"],
+                },
+            )
+            removed_calls = []
+
+            def fake_remove(photo_id, targets):
+                removed_calls.append((photo_id, targets))
+                # Photos had a user-added keyword too; it survives untouched.
+                return (["Family", "plant", "leaf", "vacation"], ["Family", "vacation"])
 
             with mock.patch.object(
-                phototagger, "set_keywords", side_effect=fake_set_keywords
-            ), mock.patch.object(
-                phototagger,
-                "inventory_album",
-                return_value=[make_item("p1", keywords=["Family"])],
+                phototagger, "remove_library_keywords", side_effect=fake_remove
             ):
-                result = phototagger.rollback_command(
-                    argparse.Namespace(run=str(run_dir))
-                )
+                result = phototagger.rollback_command(argparse.Namespace(run=str(run_dir)))
             self.assertEqual(result, 0)
-            self.assertEqual(restored_calls, [("Plants", "p1", ["Family"])])
+            self.assertEqual(removed_calls, [("p1", ["plant", "leaf"])])
             audits = list(run_dir.glob("rollback-*.jsonl"))
             self.assertEqual(len(audits), 1)
             audit_records = phototagger.read_jsonl(audits[0])
-            self.assertEqual(audit_records[-1]["status"], "restored")
+            self.assertEqual(audit_records[-1]["status"], "removed")
+            self.assertEqual(audit_records[-1]["keywords_after"], ["Family", "vacation"])
 
-    def test_rollback_flags_unverified_restore(self):
+    def test_rollback_flags_surviving_generated_tag(self):
         with TemporaryDirectory() as temp:
-            run_dir = Path(temp) / "run"
-            run_dir.mkdir()
-            phototagger.save_run(
-                run_dir, {"album": "Plants", "apply": True, "source": "album"}
-            )
+            run_dir = self._library_run(temp)
             phototagger.append_jsonl(
                 run_dir / "results.jsonl",
                 {
                     "photo_id": "p1",
                     "filename": "p1.jpg",
                     "status": "applied",
-                    "keywords_before": ["Family"],
-                    "keywords_after": ["Family", "plant"],
+                    "generated_keywords": ["plant"],
                 },
             )
-            with mock.patch.object(phototagger, "set_keywords"), mock.patch.object(
+            with mock.patch.object(
                 phototagger,
-                "inventory_album",
-                return_value=[make_item("p1", keywords=["Family", "plant"])],
+                "remove_library_keywords",
+                return_value=(["plant"], ["plant"]),  # removal did not take
             ):
-                result = phototagger.rollback_command(
-                    argparse.Namespace(run=str(run_dir))
-                )
+                result = phototagger.rollback_command(argparse.Namespace(run=str(run_dir)))
             self.assertEqual(result, 1)
             audits = list(run_dir.glob("rollback-*.jsonl"))
             audit_records = phototagger.read_jsonl(audits[0])
-            self.assertEqual(audit_records[-1]["status"], "verify-failed")
+            self.assertEqual(audit_records[-1]["status"], "error")
+
+    def test_rollback_records_vanished_photo_without_failing(self):
+        with TemporaryDirectory() as temp:
+            run_dir = self._library_run(temp)
+            phototagger.append_jsonl(
+                run_dir / "results.jsonl",
+                {
+                    "photo_id": "p1",
+                    "filename": "p1.jpg",
+                    "status": "applied",
+                    "generated_keywords": ["plant"],
+                },
+            )
+            with mock.patch.object(
+                phototagger,
+                "remove_library_keywords",
+                side_effect=phototagger.PhotoNotFoundError("gone"),
+            ):
+                result = phototagger.rollback_command(argparse.Namespace(run=str(run_dir)))
+            self.assertEqual(result, 0)
+            audits = list(run_dir.glob("rollback-*.jsonl"))
+            audit_records = phototagger.read_jsonl(audits[0])
+            self.assertEqual(audit_records[-1]["status"], "not-found")
+
+
+class InfrastructureTests(unittest.TestCase):
+    def test_parse_before_after(self):
+        before, after = phototagger.parse_before_after("a\x1fb\x1ea\x1fb\x1fc")
+        self.assertEqual(before, ["a", "b"])
+        self.assertEqual(after, ["a", "b", "c"])
+        before, after = phototagger.parse_before_after("\x1ec")
+        self.assertEqual(before, [])
+        self.assertEqual(after, ["c"])
+
+    def test_sync_library_keywords_maps_missing_id_to_not_found(self):
+        with mock.patch.object(
+            phototagger,
+            "run_applescript",
+            side_effect=RuntimeError(
+                "Photos automation failed: Can’t get media item id \"X\"."
+            ),
+        ):
+            with self.assertRaises(phototagger.PhotoNotFoundError):
+                phototagger.sync_library_keywords("X", ["plant"])
+
+    def test_run_lock_contention_fails_fast(self):
+        with TemporaryDirectory() as temp:
+            run_dir = Path(temp)
+            with phototagger.run_lock(run_dir):
+                with self.assertRaisesRegex(RuntimeError, "already operating"):
+                    with phototagger.run_lock(run_dir):
+                        pass
+
+    def test_save_run_is_atomic_and_leaves_no_temp_file(self):
+        with TemporaryDirectory() as temp:
+            run_dir = Path(temp)
+            phototagger.save_run(run_dir, {"status": "running"})
+            phototagger.save_run(run_dir, {"status": "complete"})
+            self.assertEqual(phototagger.load_run(run_dir)["status"], "complete")
+            self.assertFalse((run_dir / "run.json.tmp").exists())
+
+    def test_load_manifest_deduplicates_preserving_order(self):
+        with TemporaryDirectory() as temp:
+            run_dir = Path(temp)
+            for photo_id in ("a", "b", "a", "c"):
+                phototagger.append_jsonl(
+                    run_dir / "manifest.jsonl",
+                    {"photo_id": photo_id, "filename": f"{photo_id}.jpg"},
+                )
+            entries = phototagger.load_manifest(run_dir)
+            self.assertEqual([entry["photo_id"] for entry in entries], ["a", "b", "c"])
+
+    def test_build_manifest_resumes_partial_sweep(self):
+        with TemporaryDirectory() as temp:
+            run_dir = Path(temp)
+            # A previous build already swept indexes 1-100.
+            for index in range(1, 101):
+                phototagger.append_jsonl(
+                    run_dir / "manifest.jsonl",
+                    {"photo_id": f"id{index}", "swept_index": index},
+                )
+            calls = []
+
+            def fake_inventory(start, count, order="ascending", timeout=1800):
+                calls.append((start, count))
+                return [
+                    make_item(f"id{start + offset}", source_index=start + offset)
+                    for offset in range(count)
+                    if start + offset <= 150
+                ]
+
+            with mock.patch.object(
+                phototagger, "library_count", return_value=150
+            ), mock.patch.object(
+                phototagger, "inventory_library_batch", side_effect=fake_inventory
+            ):
+                total = phototagger.build_manifest(run_dir, "ascending")
+            self.assertEqual(calls[0][0], 101)  # resumed, not restarted
+            self.assertEqual(total, 150)
+
+    def test_resolve_model_defaults_and_validation(self):
+        self.assertEqual(phototagger.resolve_model("ollama", None), "gemma4:e4b-it-qat")
+        self.assertEqual(phototagger.resolve_model("ollama", "custom"), "custom")
+        self.assertEqual(
+            phototagger.resolve_model("anthropic", "claude-sonnet-5"), "claude-sonnet-5"
+        )
+        with self.assertRaisesRegex(RuntimeError, "requires an explicit --model"):
+            phototagger.resolve_model("anthropic", None)
+
+    def test_rename_prefix_rejects_library_runs(self):
+        with TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "run"
+            run_dir.mkdir()
+            phototagger.save_run(
+                run_dir,
+                {"album": "Photos Library", "apply": True, "source": "library"},
+            )
+            with self.assertRaisesRegex(RuntimeError, "only supports album runs"):
+                phototagger.rename_prefix_command(
+                    argparse.Namespace(run=str(run_dir), from_prefix="AI: ", to_prefix="")
+                )
+
+    def test_set_library_order_reverses_manifest(self):
+        with TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "run"
+            run_dir.mkdir()
+            phototagger.save_run(
+                run_dir,
+                {
+                    "album": "Photos Library",
+                    "apply": True,
+                    "order": "ascending",
+                    "source": "library",
+                },
+            )
+            for photo_id in ("a", "b", "c"):
+                phototagger.append_jsonl(
+                    run_dir / "manifest.jsonl", {"photo_id": photo_id}
+                )
+            result = phototagger.set_library_order_command(
+                argparse.Namespace(run=str(run_dir), order="descending")
+            )
+            self.assertEqual(result, 0)
+            entries = phototagger.load_manifest(run_dir)
+            self.assertEqual([entry["photo_id"] for entry in entries], ["c", "b", "a"])
+            metadata = phototagger.load_run(run_dir)
+            self.assertEqual(metadata["order"], "descending")
 
 
 class SanitizationTests(unittest.TestCase):

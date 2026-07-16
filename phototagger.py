@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import csv
+import fcntl
 import json
 import os
 import re
@@ -52,7 +54,10 @@ IMAGE_EXTENSIONS = {
     ".webp",
 } | RAW_EXTENSIONS
 # Statuses that must be retried on resume; anything else counts as completed.
-RETRY_STATUSES = {"error", "verify-failed"}
+# "write-pending" is the write-ahead journal entry appended immediately before
+# a Photos mutation: if it is the latest record for a photo, the process died
+# mid-write and the (idempotent) write must be retried.
+RETRY_STATUSES = {"error", "verify-failed", "write-pending"}
 TAG_ALIASES = {
     "cacti": "cactus",
     "house plant": "houseplant",
@@ -247,17 +252,6 @@ def library_directional_progress(next_index: int, total_count: int, order: str) 
     if order == "descending":
         return total_count - max(next_index, 0)
     return min(next_index - 1, total_count)
-
-
-def library_batch_review_path(
-    run_dir: Path,
-    start: int,
-    end: int,
-    order: str,
-) -> Path:
-    if order == "descending":
-        return run_dir / "batches" / f"descending-{end:06d}-{start:06d}.csv"
-    return run_dir / "batches" / f"{start:06d}-{end:06d}.csv"
 
 
 def ensure_classifier() -> None:
@@ -821,18 +815,124 @@ def export_photo(album: str, item: PhotoItem, destination: Path) -> Path:
     raise RuntimeError(f"Photos export did not yield an unambiguous still image for {item.filename}")
 
 
-def export_library_photo(item: PhotoItem, destination: Path) -> Path:
-    if item.source_index is None:
-        raise RuntimeError("Library photo is missing its source index")
+def set_keywords(album: str, identifier: str, keywords: list[str]) -> None:
+    """Exact-list replace; used only by rename-prefix, which needs it."""
+    run_applescript(
+        "set_keywords.applescript",
+        album,
+        identifier,
+        KEYWORD_SEPARATOR.join(keywords),
+    )
+
+
+class PhotoNotFoundError(RuntimeError):
+    """The photo id no longer resolves in the library (deleted or merged away)."""
+
+
+def parse_before_after(output: str) -> tuple[list[str], list[str]]:
+    """Parse a sync/remove AppleScript's 'before <FS> after' keyword lists."""
+    fields = output.split(FIELD_SEPARATOR)
+    if len(fields) != 2:
+        raise RuntimeError("Photos returned an unexpected before/after keyword payload")
+    before, after = fields
+    return (
+        before.split(KEYWORD_SEPARATOR) if before else [],
+        after.split(KEYWORD_SEPARATOR) if after else [],
+    )
+
+
+def sync_keywords(
+    album: str, identifier: str, new_keywords: list[str]
+) -> tuple[list[str], list[str]]:
+    """Atomically add missing keywords to an album photo; returns (before, after)."""
+    output = run_applescript(
+        "sync_keywords.applescript",
+        album,
+        identifier,
+        KEYWORD_SEPARATOR.join(new_keywords),
+    )
+    return parse_before_after(output)
+
+
+def sync_library_keywords(
+    identifier: str, new_keywords: list[str]
+) -> tuple[list[str], list[str]]:
+    """Atomically add missing keywords to a library photo by id; returns (before, after)."""
+    try:
+        output = run_applescript(
+            "sync_library_keywords_by_id.applescript",
+            identifier,
+            KEYWORD_SEPARATOR.join(new_keywords),
+        )
+    except RuntimeError as error:
+        if "Can’t get media item id" in str(error) or "Can't get media item id" in str(error):
+            raise PhotoNotFoundError(f"photo no longer exists: {identifier}") from error
+        raise
+    return parse_before_after(output)
+
+
+def remove_keywords(
+    album: str, identifier: str, targets: list[str]
+) -> tuple[list[str], list[str]]:
+    """Atomically remove matching keywords from an album photo; returns (before, after)."""
+    output = run_applescript(
+        "remove_keywords.applescript",
+        album,
+        identifier,
+        KEYWORD_SEPARATOR.join(targets),
+    )
+    return parse_before_after(output)
+
+
+def remove_library_keywords(
+    identifier: str, targets: list[str]
+) -> tuple[list[str], list[str]]:
+    """Atomically remove matching keywords from a library photo by id; returns (before, after)."""
+    try:
+        output = run_applescript(
+            "remove_library_keywords_by_id.applescript",
+            identifier,
+            KEYWORD_SEPARATOR.join(targets),
+        )
+    except RuntimeError as error:
+        if "Can’t get media item id" in str(error) or "Can't get media item id" in str(error):
+            raise PhotoNotFoundError(f"photo no longer exists: {identifier}") from error
+        raise
+    return parse_before_after(output)
+
+
+def library_item_by_id(identifier: str) -> PhotoItem | None:
+    """Read one library photo by id; None when the photo no longer exists."""
+    output = run_applescript("library_item_by_id.applescript", identifier, timeout=120)
+    if output == "NOT_FOUND":
+        return None
+    fields = output.split(FIELD_SEPARATOR)
+    if len(fields) != 4 or fields[0] != "FOUND":
+        raise RuntimeError("Photos returned an unexpected item-by-id payload")
+    _, filename, keyword_text, capture_date = fields
+    keywords = keyword_text.split(KEYWORD_SEPARATOR) if keyword_text else []
+    return PhotoItem(
+        identifier=identifier,
+        filename=filename,
+        keywords=keywords,
+        capture_date=capture_date,
+    )
+
+
+def export_library_photo_by_id(item: PhotoItem, destination: Path) -> Path:
     destination.mkdir(parents=True, exist_ok=True)
     before = {path.name for path in destination.iterdir()}
-    run_applescript(
-        "export_library_item.applescript",
-        str(item.source_index),
-        item.identifier,
-        str(destination),
-        timeout=1800,
-    )
+    try:
+        run_applescript(
+            "export_library_item_by_id.applescript",
+            item.identifier,
+            str(destination),
+            timeout=1800,
+        )
+    except RuntimeError as error:
+        if "PHOTO_NOT_FOUND" in str(error):
+            raise PhotoNotFoundError(f"photo no longer exists: {item.identifier}") from error
+        raise
     created = [path for path in destination.iterdir() if path.name not in before and path.is_file()]
     try:
         return choose_exported_image(created, item.filename)
@@ -842,26 +942,6 @@ def export_library_photo(item: PhotoItem, destination: Path) -> Path:
         candidates = [path for path in destination.iterdir() if path.is_file()]
         return choose_exported_image(candidates, item.filename)
     raise RuntimeError(f"Photos export did not yield an unambiguous still image for {item.filename}")
-
-
-def set_keywords(album: str, identifier: str, keywords: list[str]) -> None:
-    run_applescript(
-        "set_keywords.applescript",
-        album,
-        identifier,
-        KEYWORD_SEPARATOR.join(keywords),
-    )
-
-
-def set_library_keywords(item: PhotoItem, keywords: list[str]) -> None:
-    if item.source_index is None:
-        raise RuntimeError("Library photo is missing its source index")
-    run_applescript(
-        "set_library_keywords.applescript",
-        str(item.source_index),
-        item.identifier,
-        KEYWORD_SEPARATOR.join(keywords),
-    )
 
 
 def read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -968,14 +1048,23 @@ def verify_applied_batch(
     current_items: Iterable[PhotoItem],
     records_by_photo: dict[str, dict[str, object]],
 ) -> int:
-    """Confirm Photos holds the applied keywords; log each failure durably as retryable."""
+    """Confirm Photos still holds this run's generated tags; log failures durably.
+
+    Subset semantics: the photo's current keywords must contain every keyword
+    this run generated (case-insensitive). Keywords the user added or removed
+    concurrently in Photos.app are theirs to manage and never count as
+    failures — the old exact-list match would have flagged any concurrent
+    manual edit as corruption.
+    """
     current = {item.identifier: item for item in current_items}
     failures = 0
     for photo_id, record in records_by_photo.items():
         if str(record.get("status", "")) != "applied":
             continue
         item = current.get(photo_id)
-        if item is not None and set(item.keywords) == set(record.get("keywords_after", [])):
+        if item is not None and generated_keywords_present(
+            item.keywords, record.get("generated_keywords", [])
+        ):
             continue
         failures += 1
         append_jsonl(
@@ -986,9 +1075,10 @@ def verify_applied_batch(
                 "error": (
                     "verification could not find the photo in the batch"
                     if item is None
-                    else "verification found different keywords in Photos than were applied"
+                    else "verification found this run's generated keywords missing in Photos"
                 ),
                 "filename": record.get("filename", ""),
+                "generated_keywords": record.get("generated_keywords", []),
                 "keywords_before": record.get("keywords_before", []),
                 "keywords_expected": record.get("keywords_after", []),
                 "keywords_found": item.keywords if item is not None else [],
@@ -1006,25 +1096,6 @@ def verify_applied_batch(
     return failures
 
 
-def advance_library_cursor(
-    metadata: dict[str, object],
-    batch_start: int,
-    count: int,
-    order: str,
-) -> None:
-    """Move the cursor past a batch. Callers must verify the batch first."""
-    metadata["next_index"] = library_next_index(batch_start, count, order)
-    metadata["status"] = (
-        "complete"
-        if library_cursor_complete(
-            int(metadata["next_index"]),
-            int(metadata["total_count"]),
-            order,
-        )
-        else "batch_complete"
-    )
-
-
 def write_review(run_dir: Path) -> None:
     attempts = read_jsonl(run_dir / "results.jsonl")
     latest_by_photo = latest_records_by_photo(attempts)
@@ -1039,10 +1110,102 @@ def load_run(run_dir: Path) -> dict[str, object]:
 
 
 def save_run(run_dir: Path, metadata: dict[str, object]) -> None:
-    (run_dir / "run.json").write_text(
+    """Atomically replace run.json so a crash mid-write cannot corrupt the cursor."""
+    target = run_dir / "run.json"
+    temp = run_dir / "run.json.tmp"
+    temp.write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    temp.replace(target)
+
+
+@contextlib.contextmanager
+def run_lock(run_dir: Path):
+    """Exclusive per-run lock so mutating commands cannot run concurrently.
+
+    Uses command.lock (not runner.lock) so the background runner — which holds
+    runner.lock for its whole loop while invoking `tag --resume` as a child
+    process — does not deadlock against its own child. Every mutating command
+    (tag --resume, rollback, rename-prefix, set-library-order) takes this lock,
+    which serializes actual Photos/run.json mutations regardless of who
+    launched them.
+    """
+    handle = (run_dir / "command.lock").open("w")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(
+                f"another PhotoTagger command is already operating on {run_dir.name}; "
+                "wait for it to finish (or stop the background runner) and retry"
+            ) from None
+        yield
+    finally:
+        handle.close()
+
+
+def load_manifest(run_dir: Path) -> list[dict[str, object]]:
+    """Load the run's fixed photo-id manifest, deduplicated, in traversal order."""
+    entries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for record in read_jsonl(run_dir / "manifest.jsonl"):
+        photo_id = str(record.get("photo_id", ""))
+        if not photo_id or photo_id in seen:
+            continue
+        seen.add(photo_id)
+        entries.append(record)
+    return entries
+
+
+def build_manifest(run_dir: Path, order: str, chunk_size: int = 100) -> int:
+    """One full positional sweep capturing every photo id into manifest.jsonl.
+
+    This is the only remaining positional traversal; everything afterwards is
+    addressed purely by photo id, so library growth/shrinkage between batches
+    can no longer skew which photos get processed. Appends chunk-by-chunk and
+    resumes a partial build from the last recorded position.
+    """
+    manifest_path = run_dir / "manifest.jsonl"
+    existing = read_jsonl(manifest_path)
+    total = library_count()
+    if order == "descending":
+        start = total
+        if existing:
+            start = int(existing[-1].get("swept_index", total)) - 1
+    else:
+        start = 1
+        if existing:
+            start = int(existing[-1].get("swept_index", 0)) + 1
+    swept = len(existing)
+    while (order == "descending" and start >= 1) or (order == "ascending" and start <= total):
+        count = min(chunk_size, start if order == "descending" else total - start + 1)
+        chunk = inventory_library_batch(start, count, order, timeout=600)
+        if not chunk:
+            break
+        for item in chunk:
+            append_jsonl(
+                manifest_path,
+                {
+                    "capture_date": item.capture_date,
+                    "filename": item.filename,
+                    "photo_id": item.identifier,
+                    "swept_index": item.source_index,
+                },
+            )
+        swept += len(chunk)
+        start = library_next_index(start, count, order)
+        if swept % 2000 < chunk_size:
+            print(f"manifest: {swept} photos recorded", flush=True)
+    return len(load_manifest(run_dir))
+
+
+def generated_keywords_present(
+    current: Iterable[str], generated: Iterable[str]
+) -> bool:
+    """Subset check: this run's tags must be present; extra keywords are fine."""
+    have = {str(value).casefold() for value in current}
+    return all(str(value).casefold() in have for value in generated)
 
 
 def new_run_directory(base: Path, album: str) -> Path:
@@ -1051,6 +1214,19 @@ def new_run_directory(base: Path, album: str) -> Path:
     run_dir = base / f"{stamp}-{slug}"
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
+
+
+def resolve_model(backend: str, model: str | None) -> str:
+    """Backend-aware model default; never send an Ollama model name to Anthropic."""
+    if model:
+        return model
+    if backend == "ollama":
+        return "gemma4:e4b-it-qat"
+    if backend == "anthropic":
+        raise RuntimeError(
+            "--backend anthropic requires an explicit --model (e.g. claude-sonnet-5)"
+        )
+    return ""
 
 
 def tag_command(args: argparse.Namespace) -> int:
@@ -1086,7 +1262,7 @@ def tag_command(args: argparse.Namespace) -> int:
         keep_exports = args.keep_exports
         limit = args.limit
         backend = args.backend
-        model = args.model
+        model = resolve_model(args.backend, args.model)
         batch_size = args.batch_size if args.batch_size is not None else 25
         library_order = args.order
         run_dir = new_run_directory(Path(args.runs_dir).resolve(), album)
@@ -1104,75 +1280,183 @@ def tag_command(args: argparse.Namespace) -> int:
             "prefix": prefix,
             "source": source_type,
             "status": "running",
-            "version": 4,
+            "version": 5,
         }
         if source_type == "library":
             metadata["order"] = library_order
-            metadata["total_count"] = library_count()
-            metadata["next_index"] = (
-                metadata["total_count"] if library_order == "descending" else 1
-            )
         save_run(run_dir, metadata)
 
-    batch_start = 0
+    # Serialize against the background runner and any other mutating command
+    # operating on this run directory.
+    with run_lock(run_dir):
+        return run_tag_batch(
+            run_dir,
+            metadata,
+            source_type=source_type,
+            album=album,
+            apply_changes=apply_changes,
+            confidence=confidence,
+            max_tags=max_tags,
+            prefix=prefix,
+            keep_exports=keep_exports,
+            limit=limit,
+            backend=backend,
+            model=model,
+            batch_size=batch_size,
+            library_order=library_order,
+        )
+
+
+def run_tag_batch(
+    run_dir: Path,
+    metadata: dict[str, object],
+    *,
+    source_type: str,
+    album: str,
+    apply_changes: bool,
+    confidence: float,
+    max_tags: int,
+    prefix: str,
+    keep_exports: bool,
+    limit: int,
+    backend: str,
+    model: str,
+    batch_size: int,
+    library_order: str,
+) -> int:
     if source_type == "library":
-        current_total = library_count()
-        expected_total = int(metadata["total_count"])
-        if current_total != expected_total:
-            raise RuntimeError(
-                f"Photos library count changed from {expected_total} to {current_total}; "
-                "the index cursor was stopped to prevent skipped or duplicate items"
-            )
-        library_order = str(metadata.get("order", "ascending"))
         if library_order not in {"ascending", "descending"}:
             raise RuntimeError(f"unknown saved library order: {library_order!r}")
-        default_index = expected_total if library_order == "descending" else 1
-        batch_start = int(metadata.get("next_index", default_index))
-        if library_cursor_complete(batch_start, expected_total, library_order):
-            metadata["status"] = "complete"
-            metadata["completed_at"] = utc_now()
-            save_run(run_dir, metadata)
-            print(f"Library run complete: {expected_total} items covered")
-            return 0
-        items = inventory_library_batch_chunked(batch_start, batch_size, library_order)
-        if not items:
+        if "next_index" in metadata and not (run_dir / "manifest.jsonl").exists():
             raise RuntimeError(
-                f"Photos returned no items at library index {batch_start}; "
-                "stopping instead of advancing the cursor"
+                "this run predates id-based traversal; migrate it first: "
+                f"python3 scripts/migrate_run_to_manifest.py {run_dir}"
             )
+        if not (run_dir / "manifest.jsonl").exists():
+            print("Building the photo-id manifest (one-time full sweep)")
+        manifest_total = (
+            build_manifest(run_dir, library_order)
+            if not (run_dir / "manifest.jsonl").exists()
+            else None
+        )
+        manifest = load_manifest(run_dir)
+        metadata["manifest_total"] = len(manifest)
+        if manifest_total is not None:
+            metadata["manifest_built_at"] = utc_now()
+        save_run(run_dir, metadata)
+        current_total = library_count()
+        if current_total != len(manifest):
+            print(
+                f"note: Photos now reports {current_total} items vs {len(manifest)} in "
+                "the manifest; ids that no longer resolve are recorded as not-found"
+            )
+        items = [
+            PhotoItem(
+                identifier=str(entry.get("photo_id", "")),
+                filename=str(entry.get("filename", "")),
+                keywords=[],
+                capture_date=str(entry.get("capture_date", "")),
+            )
+            for entry in manifest
+        ]
     else:
         items = inventory_album(album)
         if limit > 0:
             items = items[:limit]
 
+    if (
+        source_type == "library"
+        and apply_changes
+        and metadata.get("status") in {"batch_errors", "batch_in_progress"}
+        and metadata.get("last_batch_photo_ids")
+    ):
+        # The previous invocation ended with errors — its verification pass
+        # may have died partway. Re-verify every photo that batch applied so
+        # an unconfirmed write can never be silently trusted; failures become
+        # retryable records and re-enter pending below.
+        prior_ids = [str(pid) for pid in metadata["last_batch_photo_ids"]]
+        print(f"Re-verifying {len(prior_ids)} photos from the errored batch")
+        prior_records = {
+            photo_id: record
+            for photo_id, record in latest_records_by_photo(
+                read_jsonl(run_dir / "results.jsonl")
+            ).items()
+            if photo_id in set(prior_ids)
+        }
+        prior_current = [
+            current
+            for photo_id in prior_records
+            if (current := library_item_by_id(photo_id)) is not None
+        ]
+        reverify_failures = verify_applied_batch(run_dir, prior_current, prior_records)
+        if reverify_failures:
+            print(
+                f"{reverify_failures} photo(s) failed re-verification and will be retried",
+                file=sys.stderr,
+            )
+
     latest_by_photo = latest_records_by_photo(read_jsonl(run_dir / "results.jsonl"))
-    pending = pending_items(items, latest_by_photo)
+    all_pending = pending_items(items, latest_by_photo)
+    pending = all_pending[:batch_size] if source_type == "library" else all_pending
 
     mode = "APPLY" if apply_changes else "DRY RUN"
     if source_type == "library":
-        batch_end = library_batch_end(batch_start, len(items), library_order)
         print(
-            f"{mode} BATCH: {len(pending)} pending of {len(items)} items "
-            f"at library indexes {batch_start} to {batch_end} ({library_order})"
+            f"{mode} BATCH: {len(pending)} of {len(all_pending)} pending photos "
+            f"({len(items) - len(all_pending)} of {len(items)} already complete, {library_order})"
         )
     else:
         print(f"{mode}: {len(pending)} pending of {len(items)} selected photos in {album!r}")
     print(f"Run directory: {run_dir}")
-    # Album runs with nothing pending are simply complete. Library runs fall
-    # through even with an empty pending list so the batch is (re-)verified
-    # before the cursor may advance — a verify-failed or verify-crashed batch
-    # must never be skipped past on resume.
-    if not pending and source_type == "album":
+    if not pending:
         metadata["status"] = "complete"
         metadata["completed_at"] = utc_now()
         save_run(run_dir, metadata)
-        write_review(run_dir)
+        if source_type == "album":
+            write_review(run_dir)
+        else:
+            print(f"Library run complete: {len(items)} manifest photos covered")
         return 0
+
+    if source_type == "library" and apply_changes:
+        # Marker written BEFORE the write loop: a crash anywhere in this batch
+        # (including during verification) leaves status batch_in_progress with
+        # this batch's photo ids, so the next resume re-verifies them all.
+        # results.jsonl remains the source of truth for what actually happened.
+        metadata["status"] = "batch_in_progress"
+        metadata["batch_started_at"] = utc_now()
+        metadata["last_batch_photo_ids"] = [item.identifier for item in pending]
+        save_run(run_dir, metadata)
 
     persistent_exports = run_dir / "exports"
     error_count = 0
+    not_found_count = 0
     batch_records: list[dict[str, object]] = []
     for index, item in enumerate(pending, start=1):
+        if source_type == "library":
+            # Manifest entries carry no live state; re-read by id so filename
+            # and keywords reflect Photos right now (or learn the photo is gone).
+            current = library_item_by_id(item.identifier)
+            if current is None:
+                not_found_count += 1
+                append_jsonl(
+                    run_dir / "results.jsonl",
+                    {
+                        "album": album,
+                        "capture_date": item.capture_date,
+                        "filename": item.filename,
+                        "photo_id": item.identifier,
+                        "source": source_type,
+                        "status": "not-found",
+                        "timestamp": utc_now(),
+                    },
+                )
+                print(
+                    f"[{index}/{len(pending)}] {item.filename}: no longer in the library",
+                    flush=True,
+                )
+                continue
+            item = current
         print(f"[{index}/{len(pending)}] {item.filename}", flush=True)
         record: dict[str, object] = {
             "album": album,
@@ -1207,7 +1491,7 @@ def tag_command(args: argparse.Namespace) -> int:
                             if stale.is_file():
                                 stale.unlink()
                     image_path = (
-                        export_library_photo(item, item_export_dir)
+                        export_library_photo_by_id(item, item_export_dir)
                         if source_type == "library"
                         else export_photo(album, item, item_export_dir)
                     )
@@ -1221,7 +1505,7 @@ def tag_command(args: argparse.Namespace) -> int:
                 else:
                     with tempfile.TemporaryDirectory(prefix="phototagger-") as temp:
                         image_path = (
-                            export_library_photo(item, Path(temp))
+                            export_library_photo_by_id(item, Path(temp))
                             if source_type == "library"
                             else export_photo(album, item, Path(temp))
                         )
@@ -1247,111 +1531,155 @@ def tag_command(args: argparse.Namespace) -> int:
                     descriptive,
                     determination_keywords(determinations, prefix=prefix),
                 )
-                merged = merge_keywords(item.keywords, generated)
-                if apply_changes and generated:
-                    if source_type == "library":
-                        set_library_keywords(item, merged)
-                    else:
-                        set_keywords(album, item.identifier, merged)
-                    status = "applied"
-                elif apply_changes:
-                    status = "no-tags"
-                else:
-                    status = "review"
                 record.update(
                     {
                         "classifications": classifications,
                         "determinations": determinations,
                         "generated_keywords": generated,
-                        "keywords_after": merged,
-                        "status": status,
                     }
                 )
+                if apply_changes and generated:
+                    # Write-ahead journal: persist intent durably BEFORE the
+                    # Photos mutation. If we crash between here and the
+                    # "applied" record below, this write-pending record is the
+                    # latest for the photo, so resume retries the (idempotent)
+                    # sync — a Photos write can never outrun its journal.
+                    append_jsonl(
+                        run_dir / "results.jsonl",
+                        {**record, "status": "write-pending"},
+                    )
+                    if source_type == "library":
+                        before, after = sync_library_keywords(item.identifier, generated)
+                    else:
+                        before, after = sync_keywords(album, item.identifier, generated)
+                    # The sync AppleScript read the true pre-write keywords
+                    # atomically with the write; journal those, not the
+                    # inventory-time snapshot.
+                    record.update(
+                        {
+                            "keywords_before": before,
+                            "keywords_after": after,
+                            "status": "applied",
+                        }
+                    )
+                elif apply_changes:
+                    record.update(
+                        {"keywords_after": item.keywords, "status": "no-tags"}
+                    )
+                else:
+                    record.update(
+                        {
+                            "keywords_after": merge_keywords(item.keywords, generated),
+                            "status": "review",
+                        }
+                    )
+        except PhotoNotFoundError:
+            not_found_count += 1
+            record.update({"status": "not-found"})
+            print("  photo no longer in the library", flush=True)
         except Exception as error:  # continue so one iCloud/export failure does not lose the run
             error_count += 1
             record.update({"error": str(error), "status": "error"})
             print(f"  ERROR: {error}", file=sys.stderr)
+        record["timestamp"] = utc_now()
         append_jsonl(run_dir / "results.jsonl", record)
         batch_records.append(record)
         if source_type == "album":
             write_review(run_dir)
 
     if source_type == "library":
-        batch_end = library_batch_end(batch_start, len(items), library_order)
-        batch_review_path = library_batch_review_path(
-            run_dir, batch_start, batch_end, library_order
+        batch_review_path = (
+            run_dir
+            / "batches"
+            / f"batch-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
         )
         if batch_records:
             write_review_file(batch_review_path, batch_records)
         if apply_changes:
-            # Verify every applied record for this batch's photos — including
-            # records from earlier invocations — not just this invocation's.
-            batch_ids = {item.identifier for item in items}
-            batch_records_by_photo = {
-                photo_id: record
-                for photo_id, record in latest_records_by_photo(
-                    read_jsonl(run_dir / "results.jsonl")
-                ).items()
-                if photo_id in batch_ids
+            # Re-read every photo this batch applied (by id) and confirm this
+            # run's generated tags are present. Failures become durable
+            # retryable records, so they re-enter pending on resume.
+            applied_records = {
+                str(record["photo_id"]): record
+                for record in batch_records
+                if record.get("status") == "applied"
             }
             try:
-                # With no new writes this invocation, the batch inventory read
-                # at the top already reflects the current Photos state.
-                current_items = (
-                    inventory_library_batch_chunked(batch_start, len(items), library_order)
-                    if batch_records
-                    else items
-                )
+                current_items = [
+                    current
+                    for photo_id in applied_records
+                    if (current := library_item_by_id(photo_id)) is not None
+                ]
                 error_count += verify_applied_batch(
-                    run_dir, current_items, batch_records_by_photo
+                    run_dir, current_items, applied_records
                 )
             except RuntimeError as error:
                 # Verification infrastructure itself failed (e.g. Photos
                 # dropped its automation connection). Treat as inconclusive
                 # rather than crashing before metadata is saved — every
-                # per-item result is already durable in results.jsonl, so
-                # nothing is lost, but this batch must not be trusted as
-                # verified and the cursor must not advance.
+                # per-item result is already durable in results.jsonl.
                 error_count += 1
                 print(f"  VERIFICATION ERROR: {error}", file=sys.stderr)
+        # Only meaningful when error_count == 0: every photo attempted this
+        # batch then has a terminal status, so what remains is exactly the
+        # pending photos this batch did not reach.
+        remaining = len(all_pending) - len(pending)
         if error_count:
             metadata["status"] = "batch_errors"
         else:
-            advance_library_cursor(metadata, batch_start, len(items), library_order)
-        metadata["last_batch_start"] = batch_start
-        metadata["last_batch_end"] = batch_end
+            metadata["status"] = "batch_complete" if remaining else "complete"
+        metadata["last_batch_size"] = len(pending)
+        metadata["last_batch_photo_ids"] = [item.identifier for item in pending]
         metadata["last_batch_verified"] = apply_changes and not error_count
         metadata["last_batch_completed_at"] = utc_now()
     else:
         metadata["status"] = "complete_with_errors" if error_count else "complete"
         metadata["completed_at"] = utc_now()
     metadata["errors_this_invocation"] = error_count
+    metadata["not_found_this_invocation"] = not_found_count
     save_run(run_dir, metadata)
     if source_type == "album":
         write_review(run_dir)
         review_path = run_dir / "review.csv"
     else:
         review_path = batch_review_path
-    print(f"Finished with {error_count} error(s). Review {review_path}")
+    summary = f"Finished with {error_count} error(s)"
+    if not_found_count:
+        summary += f" and {not_found_count} no-longer-present photo(s)"
+    print(f"{summary}. Review {review_path}")
     if source_type == "library" and not error_count:
-        print(
-            "Library directional progress: "
-            f"{library_directional_progress(int(metadata['next_index']), int(metadata['total_count']), library_order)} "
-            f"of {metadata['total_count']} items ({library_order})"
-        )
+        done = len(items) - len(all_pending) + len(pending)
+        print(f"Library progress: {done} of {len(items)} manifest photos ({library_order})")
     return 1 if error_count else 0
 
 
-def earliest_applied_by_photo(
+def generated_tags_by_photo(
     records: Iterable[dict[str, object]],
 ) -> dict[str, dict[str, object]]:
-    """The first applied record per photo holds the true pre-run keyword snapshot."""
-    earliest: dict[str, dict[str, object]] = {}
+    """Union of every tag this run ever generated per photo (applied or write-pending).
+
+    write-pending records count because the crash window between the journal
+    entry and the applied record means the write may or may not have reached
+    Photos — removal is idempotent either way.
+    """
+    union: dict[str, dict[str, object]] = {}
     for record in records:
-        if str(record.get("status", "")) != "applied":
+        if str(record.get("status", "")) not in {"applied", "write-pending"}:
             continue
-        earliest.setdefault(str(record.get("photo_id", "")), record)
-    return earliest
+        photo_id = str(record.get("photo_id", ""))
+        entry = union.setdefault(
+            photo_id,
+            {
+                "filename": record.get("filename", ""),
+                "generated_keywords": [],
+                "photo_id": photo_id,
+            },
+        )
+        entry["generated_keywords"] = merge_keywords(
+            entry["generated_keywords"], record.get("generated_keywords", [])
+        )
+        entry["filename"] = record.get("filename", entry["filename"])
+    return {pid: e for pid, e in union.items() if e["generated_keywords"]}
 
 
 def rollback_command(args: argparse.Namespace) -> int:
@@ -1359,88 +1687,71 @@ def rollback_command(args: argparse.Namespace) -> int:
     metadata = load_run(run_dir)
     if not metadata.get("apply"):
         raise RuntimeError("This was a dry run; it did not change Photos")
+    with run_lock(run_dir):
+        return run_rollback(run_dir, metadata)
+
+
+def run_rollback(run_dir: Path, metadata: dict[str, object]) -> int:
     source_type = str(metadata.get("source", "album"))
     album = str(metadata["album"])
-    if source_type == "library":
-        current_total = library_count()
-        expected_total = int(metadata["total_count"])
-        if current_total != expected_total:
-            raise RuntimeError(
-                f"Photos library count changed from {expected_total} to {current_total}; "
-                "rollback was stopped because saved library indexes may no longer match"
-            )
-    records = read_jsonl(run_dir / "results.jsonl")
-    applied = list(earliest_applied_by_photo(records).values())
+    targets = list(generated_tags_by_photo(read_jsonl(run_dir / "results.jsonl")).values())
     audit_path = run_dir / f"rollback-{datetime.now().strftime('%Y%m%d-%H%M%S')}.jsonl"
-    print(f"Restoring keywords for {len(applied)} photos in {album!r}")
+    print(
+        f"Removing this run's generated keywords from {len(targets)} photos in {album!r}"
+    )
+    print("Keywords added manually in Photos are left untouched")
     errors = 0
-    restored: list[dict[str, object]] = []
-    for index, record in enumerate(applied, start=1):
-        try:
-            if source_type == "library":
-                item = PhotoItem(
-                    identifier=str(record["photo_id"]),
-                    filename=str(record["filename"]),
-                    keywords=list(record.get("keywords_after", [])),
-                    source_index=int(record["source_index"]),
-                )
-                set_library_keywords(item, list(record["keywords_before"]))
-            else:
-                set_keywords(album, str(record["photo_id"]), list(record["keywords_before"]))
-            restored.append(record)
-            print(f"[{index}/{len(applied)}] restored {record['filename']}")
-        except Exception as error:
-            errors += 1
-            append_jsonl(
-                audit_path,
-                {
-                    "error": str(error),
-                    "filename": record.get("filename", ""),
-                    "photo_id": record.get("photo_id", ""),
-                    "status": "error",
-                    "timestamp": utc_now(),
-                },
-            )
-            print(f"ERROR restoring {record['filename']}: {error}", file=sys.stderr)
-    if restored:
-        print(f"Verifying {len(restored)} restored photos")
+    not_found = 0
     album_inventory: dict[str, PhotoItem] = {}
-    if restored and source_type == "album":
+    if targets and source_type == "album":
         album_inventory = {item.identifier: item for item in inventory_album(album)}
-    for record in restored:
-        photo_id = str(record.get("photo_id", ""))
+    for index, entry in enumerate(targets, start=1):
+        photo_id = str(entry["photo_id"])
+        generated = list(entry["generated_keywords"])
         audit: dict[str, object] = {
-            "filename": record.get("filename", ""),
-            "keywords_restored": record.get("keywords_before", []),
+            "filename": entry.get("filename", ""),
+            "keywords_removed": generated,
             "photo_id": photo_id,
             "timestamp": utc_now(),
         }
         try:
             if source_type == "library":
-                readback = inventory_library_batch(
-                    int(record["source_index"]), 1, "ascending", timeout=300
-                )
-                current = readback[0] if readback else None
-                if current is not None and current.identifier != photo_id:
-                    current = None
+                before, after = remove_library_keywords(photo_id, generated)
             else:
-                current = album_inventory.get(photo_id)
-            if current is None:
-                raise RuntimeError("photo was not found during read-back")
-            if set(current.keywords) != set(record.get("keywords_before", [])):
-                audit["keywords_found"] = current.keywords
-                raise RuntimeError("Photos read back different keywords than were restored")
-            audit["status"] = "restored"
+                if photo_id not in album_inventory:
+                    raise PhotoNotFoundError(f"photo no longer in album: {photo_id}")
+                before, after = remove_keywords(album, photo_id, generated)
+            audit["keywords_before"] = before
+            audit["keywords_after"] = after
+            # The remove AppleScript returns the exact list it wrote; confirm
+            # none of this run's tags survived it.
+            if any(
+                str(value).casefold() in {str(g).casefold() for g in generated}
+                for value in after
+            ):
+                raise RuntimeError("Photos still holds generated tags after removal")
+            audit["status"] = "removed"
+            print(f"[{index}/{len(targets)}] cleaned {entry.get('filename', photo_id)}")
+        except PhotoNotFoundError:
+            not_found += 1
+            audit["status"] = "not-found"
+            print(
+                f"[{index}/{len(targets)}] {entry.get('filename', photo_id)}: "
+                "no longer in the library"
+            )
         except Exception as error:
             errors += 1
-            audit.update({"error": str(error), "status": "verify-failed"})
+            audit.update({"error": str(error), "status": "error"})
             print(
-                f"VERIFY ERROR restoring {record.get('filename', photo_id)}: {error}",
+                f"ERROR cleaning {entry.get('filename', photo_id)}: {error}",
                 file=sys.stderr,
             )
         append_jsonl(audit_path, audit)
-    print(f"Restored {len(restored)} of {len(applied)} photos; {errors} error(s)")
-    if applied:
+    summary = f"Cleaned {len(targets) - errors - not_found} of {len(targets)} photos"
+    if not_found:
+        summary += f"; {not_found} no longer present"
+    print(f"{summary}; {errors} error(s)")
+    if targets:
         print(f"Audit: {audit_path}")
     return 1 if errors else 0
 
@@ -1458,8 +1769,37 @@ def coverage_command(args: argparse.Namespace) -> int:
         for photo_id, record in latest_by_photo.items()
         if str(record.get("status", "")) in RETRY_STATUSES
     )
+    manifest = load_manifest(run_dir)
+    if manifest and args.start is None and args.end is None:
+        # Manifest runs are id-addressed, so coverage is a pure local diff:
+        # every manifest photo must have a record. No AppleEvents needed.
+        missing_entries = [
+            entry for entry in manifest if str(entry.get("photo_id", "")) not in processed
+        ]
+        report_path = run_dir / f"coverage-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+        with report_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["capture_date", "filename", "photo_id"])
+            for entry in missing_entries:
+                writer.writerow(
+                    [
+                        entry.get("capture_date", ""),
+                        entry.get("filename", ""),
+                        entry.get("photo_id", ""),
+                    ]
+                )
+        print(
+            f"{len(missing_entries)} of {len(manifest)} manifest photos have no record in this run"
+        )
+        if unresolved:
+            print(
+                f"{len(unresolved)} recorded items ended in a retryable state "
+                "(error, verify-failed, or write-pending); resume the run to retry them"
+            )
+        print(f"Report: {report_path}")
+        return 1 if missing_entries or unresolved else 0
     total = library_count()
-    expected_total = int(metadata.get("total_count", 0))
+    expected_total = int(metadata.get("total_count", metadata.get("manifest_total", 0)))
     if total != expected_total:
         print(
             f"note: Photos library count is {total} but the run recorded "
@@ -1513,31 +1853,40 @@ def set_library_order_command(args: argparse.Namespace) -> int:
     metadata = load_run(run_dir)
     if metadata.get("source") != "library":
         raise RuntimeError("order can only be changed for a whole-library run")
-    previous_total_count = int(metadata["total_count"])
-    total_count = library_count()
-    previous_order = str(metadata.get("order", "ascending"))
-    previous_index = int(metadata.get("next_index", 1))
-    history = list(metadata.get("order_history", []))
-    history.append(
-        {
-            "changed_at": utc_now(),
-            "from": previous_order,
-            "previous_next_index": previous_index,
-            "previous_total_count": previous_total_count,
-            "to": args.order,
-            "total_count": total_count,
-        }
-    )
-    metadata["order_history"] = history
-    metadata["order"] = args.order
-    metadata["total_count"] = total_count
-    metadata["next_index"] = total_count if args.order == "descending" else 1
-    metadata["status"] = "batch_complete" if total_count else "complete"
-    metadata["order_changed_at"] = utc_now()
-    save_run(run_dir, metadata)
+    with run_lock(run_dir):
+        manifest_path = run_dir / "manifest.jsonl"
+        if not manifest_path.exists():
+            raise RuntimeError(
+                "this run predates id-based traversal; migrate it first: "
+                f"python3 scripts/migrate_run_to_manifest.py {run_dir}"
+            )
+        previous_order = str(metadata.get("order", "ascending"))
+        if args.order != previous_order:
+            # The manifest fixes the photo set; changing order just reverses
+            # the traversal sequence. Pending computation is unaffected.
+            entries = load_manifest(run_dir)
+            entries.reverse()
+            temp = run_dir / "manifest.jsonl.tmp"
+            if temp.exists():
+                temp.unlink()
+            for entry in entries:
+                append_jsonl(temp, entry)
+            temp.replace(manifest_path)
+        history = list(metadata.get("order_history", []))
+        history.append(
+            {
+                "changed_at": utc_now(),
+                "from": previous_order,
+                "to": args.order,
+            }
+        )
+        metadata["order_history"] = history
+        metadata["order"] = args.order
+        metadata["order_changed_at"] = utc_now()
+        save_run(run_dir, metadata)
     print(
-        f"Library order set to {args.order}; next physical Photos index is "
-        f"{metadata['next_index']}. Existing results were preserved."
+        f"Library order set to {args.order} (manifest traversal reversed). "
+        "Existing results were preserved."
     )
     return 0
 
@@ -1547,6 +1896,17 @@ def rename_prefix_command(args: argparse.Namespace) -> int:
     metadata = load_run(run_dir)
     if not metadata.get("apply"):
         raise RuntimeError("Prefixes can only be renamed from an applied run")
+    if metadata.get("source") == "library":
+        raise RuntimeError(
+            "rename-prefix only supports album runs; whole-library runs are not supported"
+        )
+    with run_lock(run_dir):
+        return run_rename_prefix(run_dir, metadata, args)
+
+
+def run_rename_prefix(
+    run_dir: Path, metadata: dict[str, object], args: argparse.Namespace
+) -> int:
     album = str(metadata["album"])
     latest: dict[str, dict[str, object]] = {}
     for record in read_jsonl(run_dir / "results.jsonl"):
@@ -1631,7 +1991,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="maximum descriptive tags; determination flags such as "
         "'screenshot' or 'blurry' are additive",
     )
-    tag.add_argument("--model", default="gemma4:e4b-it-qat", help="Ollama vision model")
+    tag.add_argument(
+        "--model",
+        default=None,
+        help="vision model (default for ollama: gemma4:e4b-it-qat; "
+        "required for the anthropic backend, e.g. claude-sonnet-5)",
+    )
     tag.add_argument(
         "--order",
         choices=("ascending", "descending"),
