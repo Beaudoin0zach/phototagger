@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Resume one PhotoTagger whole-library batch at a time until stopped or complete."""
+"""Resume PhotoTagger whole-library batches until stopped or complete.
+
+Photos.app reliably hangs after a few hundred photos of sustained AppleEvent
+load, so (with the user's standing authorization) this runner manages the
+Photos lifecycle itself: it gracefully restarts Photos between batches to
+stay under the hang threshold, and when a batch exits with EXIT_PHOTOS_HUNG
+(75) it force-kills the wedged process, relaunches, and resumes. All batch
+state is durable in the run directory, so restarts never lose work.
+"""
 
 from __future__ import annotations
 
@@ -7,15 +15,95 @@ import fcntl
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 
+ROOT = Path(__file__).resolve().parents[1]
+EXIT_PHOTOS_HUNG = 75
+DEFAULT_BATCH_SIZE = 300  # comfortably under the observed ~350-450 hang threshold
+MAX_CONSECUTIVE_HANG_RESTARTS = 5
+
+
+def log(message: str) -> None:
+    print(f"{datetime.now().isoformat()} {message}", flush=True)
+
+
+def photos_pids() -> list[int]:
+    result = subprocess.run(
+        ["pgrep", "-x", "Photos"], capture_output=True, text=True, check=False
+    )
+    return [int(pid) for pid in result.stdout.split()]
+
+
+def quit_photos(*, force: bool) -> None:
+    if not photos_pids():
+        return
+    if not force:
+        try:
+            subprocess.run(
+                ["osascript", "-e", 'tell application "Photos" to quit'],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+        except subprocess.TimeoutExpired:
+            pass  # wedged; fall through to the force kill
+        for _ in range(15):
+            if not photos_pids():
+                return
+            time.sleep(2)
+        log("graceful quit did not finish; force-killing Photos")
+    subprocess.run(["pkill", "-x", "Photos"], check=False)
+    for _ in range(15):
+        if not photos_pids():
+            return
+        time.sleep(2)
+    subprocess.run(["pkill", "-9", "-x", "Photos"], check=False)
+    time.sleep(3)
+
+
+def wait_for_photos_ready(timeout_seconds: int = 300) -> bool:
+    """Launch Photos (background) and wait until it answers a trivial query."""
+    subprocess.run(["open", "-g", "-a", "Photos"], check=False)
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            probe = subprocess.run(
+                ["osascript", str(ROOT / "applescript" / "library_count.applescript")],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            time.sleep(5)
+            continue
+        if probe.returncode == 0 and probe.stdout.strip().isdigit():
+            log(f"Photos ready ({probe.stdout.strip()} items)")
+            return True
+        time.sleep(5)
+    return False
+
+
+def restart_photos(*, force: bool) -> bool:
+    log(f"restarting Photos (force={force})")
+    try:
+        quit_photos(force=force)
+    except subprocess.TimeoutExpired:
+        subprocess.run(["pkill", "-9", "-x", "Photos"], check=False)
+        time.sleep(3)
+    return wait_for_photos_ready()
+
+
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: run_library_batches.py RUN_DIRECTORY", file=sys.stderr)
+    if len(sys.argv) not in (2, 3):
+        print("usage: run_library_batches.py RUN_DIRECTORY [BATCH_SIZE]", file=sys.stderr)
         return 2
     run_dir = Path(sys.argv[1]).resolve()
+    batch_size = int(sys.argv[2]) if len(sys.argv) == 3 else DEFAULT_BATCH_SIZE
     run_file = run_dir / "run.json"
     if not run_file.exists():
         print(f"run metadata not found: {run_file}", file=sys.stderr)
@@ -26,33 +114,53 @@ def main() -> int:
     except BlockingIOError:
         print("another library runner already holds the lock", file=sys.stderr)
         return 1
-    phototagger = Path(__file__).resolve().parents[1] / "phototagger.py"
+    phototagger = ROOT / "phototagger.py"
+    hang_restarts = 0
     while True:
         if (run_dir / "STOP").exists():
-            print(f"{datetime.now().isoformat()} STOP file found; runner paused", flush=True)
+            log("STOP file found; runner paused")
             return 0
         metadata = json.loads(run_file.read_text(encoding="utf-8"))
         if metadata.get("status") == "complete":
-            print(f"{datetime.now().isoformat()} whole-library run complete", flush=True)
+            log("whole-library run complete")
             return 0
+        # Preventive restart before every batch: a fresh Photos process stays
+        # comfortably under the sustained-load hang threshold.
+        if not restart_photos(force=False):
+            log("Photos did not become ready; stopping")
+            return 1
         manifest_total = int(metadata.get("manifest_total", 0))
-        print(
-            f"{datetime.now().isoformat()} starting next batch "
-            f"({manifest_total} photos in manifest)",
-            flush=True,
-        )
+        log(f"starting next batch of {batch_size} ({manifest_total} photos in manifest)")
         result = subprocess.run(
-            [sys.executable, str(phototagger), "tag", "--resume", str(run_dir)],
+            [
+                sys.executable,
+                str(phototagger),
+                "tag",
+                "--resume",
+                str(run_dir),
+                "--batch-size",
+                str(batch_size),
+            ],
             check=False,
         )
-        if result.returncode:
-            print(
-                f"{datetime.now().isoformat()} runner stopped after batch error "
-                f"(exit {result.returncode})",
-                file=sys.stderr,
-                flush=True,
-            )
-            return result.returncode
+        if result.returncode == 0:
+            hang_restarts = 0
+            continue
+        if result.returncode == EXIT_PHOTOS_HUNG:
+            hang_restarts += 1
+            if hang_restarts > MAX_CONSECUTIVE_HANG_RESTARTS:
+                log(
+                    f"Photos hung {hang_restarts} batches in a row; "
+                    "stopping for human eyes"
+                )
+                return 1
+            log(f"batch reported a Photos hang ({hang_restarts} in a row); force-restarting")
+            if not restart_photos(force=True):
+                log("Photos did not recover after force-restart; stopping")
+                return 1
+            continue
+        log(f"runner stopped after batch error (exit {result.returncode})")
+        return result.returncode
 
 
 if __name__ == "__main__":

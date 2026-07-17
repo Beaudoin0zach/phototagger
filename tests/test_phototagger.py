@@ -697,7 +697,8 @@ class ResumeSafetyTests(unittest.TestCase):
                 side_effect=RuntimeError("Photos automation timed out after 120s"),
             ) as read_by_id:
                 result = phototagger.tag_command(self._resume_args(run_dir))
-            self.assertEqual(result, 1)
+            # Distinct exit code tells the runner to restart Photos and resume.
+            self.assertEqual(result, phototagger.EXIT_PHOTOS_HUNG)
             limit = phototagger.CONSECUTIVE_ERROR_LIMIT
             self.assertEqual(read_by_id.call_count, limit)  # stopped early
             records = phototagger.read_jsonl(run_dir / "results.jsonl")

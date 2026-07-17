@@ -61,6 +61,10 @@ RETRY_STATUSES = {"error", "verify-failed", "write-pending"}
 # A hung Photos fails every AppleEvent; stop the batch after this many
 # consecutive per-item errors instead of grinding through the rest.
 CONSECUTIVE_ERROR_LIMIT = 8
+# Exit code signalling "Photos appears hung; restart it and resume" — chosen
+# to match EX_TEMPFAIL so the guarded runner can distinguish a recoverable
+# hang from a real error that needs human eyes.
+EXIT_PHOTOS_HUNG = 75
 TAG_ALIASES = {
     "cacti": "cactus",
     "house plant": "houseplant",
@@ -1434,6 +1438,7 @@ def run_tag_batch(
     error_count = 0
     not_found_count = 0
     consecutive_errors = 0
+    circuit_broken = False
     batch_records: list[dict[str, object]] = []
     for index, item in enumerate(pending, start=1):
         if consecutive_errors >= CONSECUTIVE_ERROR_LIMIT:
@@ -1441,6 +1446,7 @@ def run_tag_batch(
             # subsequent AppleEvent too). Stop the batch cleanly rather than
             # churning out hundreds of error records; everything so far is
             # durable and the batch resumes normally once Photos recovers.
+            circuit_broken = True
             print(
                 f"stopping batch after {consecutive_errors} consecutive errors; "
                 "Photos may need to be reopened before resuming",
@@ -1630,6 +1636,8 @@ def run_tag_batch(
                 # rather than crashing before metadata is saved — every
                 # per-item result is already durable in results.jsonl.
                 error_count += 1
+                if "timed out" in str(error):
+                    circuit_broken = True  # hang signature; runner may restart Photos
                 print(f"  VERIFICATION ERROR: {error}", file=sys.stderr)
         # Only meaningful when error_count == 0: every photo attempted this
         # batch then has a terminal status, so what remains is exactly the
@@ -1661,6 +1669,8 @@ def run_tag_batch(
     if source_type == "library" and not error_count:
         done = len(items) - len(all_pending) + len(pending)
         print(f"Library progress: {done} of {len(items)} manifest photos ({library_order})")
+    if circuit_broken:
+        return EXIT_PHOTOS_HUNG
     return 1 if error_count else 0
 
 
