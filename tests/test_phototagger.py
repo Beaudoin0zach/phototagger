@@ -682,6 +682,76 @@ class ResumeSafetyTests(unittest.TestCase):
             metadata = phototagger.load_run(run_dir)
             self.assertEqual(metadata["status"], "complete")
 
+    def test_non_timeout_errors_do_not_trip_the_circuit_breaker(self):
+        # Regression: 8 adjacent photos failing export with "0 candidate still
+        # images" (a transient cold-start condition, not a hang) tripped the
+        # breaker, which made the runner force-restart Photos in a loop —
+        # guaranteeing the next batch also started cold on the same photos.
+        with TemporaryDirectory() as temp:
+            manifest_ids = tuple(f"p{i}" for i in range(1, 13))
+            run_dir = self._library_run_dir(temp, manifest_ids=manifest_ids)
+            failing = {f"p{i}" for i in range(1, 11)}  # 10 consecutive failures
+
+            def fake_export(item, destination):
+                if item.identifier in failing:
+                    raise RuntimeError(
+                        f"Photos export produced 0 candidate still images for {item.filename}"
+                    )
+                return Path("/tmp/fake.jpg")
+
+            reads: dict = {}
+
+            def read_by_id(pid):
+                # batch read first, verify read second
+                if pid in reads:
+                    return make_item(pid, keywords=["plant"])
+                reads[pid] = True
+                return make_item(pid, keywords=[])
+
+            with mock.patch.object(
+                phototagger, "library_count", return_value=12
+            ), mock.patch.object(
+                phototagger, "library_item_by_id", side_effect=read_by_id
+            ), mock.patch.object(
+                phototagger,
+                "export_library_photo_with_warmup_retry",
+                side_effect=fake_export,
+            ), mock.patch.object(
+                phototagger, "classify", return_value=self._classify_result()
+            ), mock.patch.object(
+                phototagger, "sync_library_keywords", return_value=([], ["plant"])
+            ) as sync:
+                result = phototagger.tag_command(self._resume_args(run_dir))
+            # Plain errors, not a hang: exit 1, and the batch continued PAST
+            # the failing cluster to apply the photos behind it.
+            self.assertEqual(result, 1)
+            self.assertEqual(sync.call_count, 2)  # p11, p12 still processed
+            metadata = phototagger.load_run(run_dir)
+            self.assertEqual(metadata["status"], "batch_errors")
+            self.assertEqual(metadata["applied_this_invocation"], 2)
+            self.assertEqual(metadata["errors_this_invocation"], 10)
+
+    def test_empty_export_retries_once_after_warmup(self):
+        calls = []
+
+        def flaky_export(item, destination):
+            calls.append(item.identifier)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "Photos export produced 0 candidate still images for p1.jpg"
+                )
+            return Path("/tmp/fake.jpg")
+
+        with mock.patch.object(
+            phototagger, "export_library_photo_by_id", side_effect=flaky_export
+        ), mock.patch.object(phototagger.time, "sleep") as sleep:
+            result = phototagger.export_library_photo_with_warmup_retry(
+                make_item("p1"), Path("/tmp")
+            )
+        self.assertEqual(result, Path("/tmp/fake.jpg"))
+        self.assertEqual(len(calls), 2)
+        sleep.assert_called_once_with(20)
+
     def test_consecutive_errors_trip_the_circuit_breaker(self):
         # A hung Photos fails every AppleEvent; the batch must stop early with
         # durable error records and saved metadata instead of grinding through

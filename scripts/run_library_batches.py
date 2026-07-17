@@ -116,6 +116,7 @@ def main() -> int:
         return 1
     phototagger = ROOT / "phototagger.py"
     hang_restarts = 0
+    no_progress_batches = 0
     while True:
         if (run_dir / "STOP").exists():
             log("STOP file found; runner paused")
@@ -143,8 +144,12 @@ def main() -> int:
             ],
             check=False,
         )
+        metadata = json.loads(run_file.read_text(encoding="utf-8"))
+        applied = int(metadata.get("applied_this_invocation", 0))
+        errors = int(metadata.get("errors_this_invocation", 0))
         if result.returncode == 0:
             hang_restarts = 0
+            no_progress_batches = 0
             continue
         if result.returncode == EXIT_PHOTOS_HUNG:
             hang_restarts += 1
@@ -158,6 +163,30 @@ def main() -> int:
             if not restart_photos(force=True):
                 log("Photos did not recover after force-restart; stopping")
                 return 1
+            continue
+        if result.returncode == 1 and applied > 0:
+            # The batch had per-item errors but still made real progress.
+            # Errors are durable, retryable records — keep going and let the
+            # retry machinery (and coverage reporting) handle the stragglers.
+            hang_restarts = 0
+            no_progress_batches = 0
+            log(
+                f"batch finished with {errors} per-item error(s) but applied "
+                f"{applied} photo(s); continuing"
+            )
+            continue
+        if result.returncode == 1:
+            no_progress_batches += 1
+            if no_progress_batches >= 3:
+                log(
+                    f"{no_progress_batches} consecutive batches made no progress; "
+                    "stopping for human eyes"
+                )
+                return 1
+            log(
+                f"batch made no progress ({errors} error(s)); "
+                f"retrying ({no_progress_batches}/3)"
+            )
             continue
         log(f"runner stopped after batch error (exit {result.returncode})")
         return result.returncode
