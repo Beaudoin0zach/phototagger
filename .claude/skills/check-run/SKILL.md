@@ -91,14 +91,42 @@ ls -t "$run/batches"/*.csv | head -1    # newest batch CSV — spot-check labels
 Healthy runner log lines look like `starting next batch of 300` and
 `restarting Photos (force=False)`. Trouble signals:
 
-- `batch reported a Photos hang (N in a row); force-restarting` — the known
-  failure mode. Photos wedges under sustained AppleEvent load (~350–450 photos).
-  The runner force-kills and relaunches Photos itself. One or two in a row is
-  normal; it only gives up (`Photos hung N batches in a row; stopping for human
-  eyes`) after 5 consecutive hangs.
+- `batch reported a Photos hang (N in a row); force-restarting` — the runner
+  force-kills and relaunches Photos itself. One or two in a row is normal; it
+  gives up (`Photos hung N batches in a row; stopping for human eyes`) after 5.
+  **Check free disk before anything else** — see below.
 - `N consecutive batches made no progress; stopping` — 3 no-progress batches;
-  needs human eyes. Usually Photos or iCloud is unhealthy, or exports are
-  failing. Check that Photos opens and the library is downloaded.
+  needs human eyes. **Check free disk first**, then that Photos opens.
+
+### Photos hangs are almost always a DISK-SPACE problem
+
+**Check this first, before restarting anything:**
+
+```bash
+df -h /System/Volumes/Data | tail -1        # want ≥ 20 GB, comfortably more
+```
+
+Measured on the live run (2026-07-25): at 12 GB free, a day produced 675 applied
+photos and **544** empty-export failures; the next day at 64 GB free produced 674
+applied and **0** failures. Same throughput — the only variable was free space.
+
+Why: iCloud "Optimize Mac Storage" means most photos have no local original, so
+every export must first *download* it, and these libraries are RAW-heavy (~30 MB
+per CR3). With the disk near full those downloads have nowhere to land, `export`
+returns zero files, and Photos eventually wedges into 120s timeouts.
+
+So `Photos export produced 0 candidate still images` means **check free disk**,
+not "Photos is cold". An earlier theory blamed sustained AppleEvent load; the
+restart-between-batches machinery came from that theory and treats a symptom.
+The watchdog's 20 GB disk guard is what matches the real cause.
+
+If space is tight, look at `~/Library/Metadata/CoreSpotlight` first — a bloated
+search index (pure derived data; macOS rebuilds it) was 74 GB on the MacBook.
+Restart `spotlightknowledged`/`corespotlightd` afterwards to release handles on
+the deleted files. Do **not** go hunting in `~/data/public-ledger`: single-copy,
+no cloud backup, and its "derived" DBs are cited evidence in `CLAIMS.md`.
+Do not manually force iCloud eviction either — with Optimize already on, macOS
+evicts under pressure by itself and the run's downloads just refill it.
 - `whole-library run complete` — done on this machine.
 
 ## Step 5 — how close are the two fronts to meeting?
