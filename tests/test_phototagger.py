@@ -714,7 +714,7 @@ class ResumeSafetyTests(unittest.TestCase):
                 phototagger, "library_item_by_id", side_effect=read_by_id
             ), mock.patch.object(
                 phototagger,
-                "export_library_photo_with_warmup_retry",
+                "export_library_photo_by_id",
                 side_effect=fake_export,
             ), mock.patch.object(
                 phototagger, "classify", return_value=self._classify_result()
@@ -731,26 +731,37 @@ class ResumeSafetyTests(unittest.TestCase):
             self.assertEqual(metadata["applied_this_invocation"], 2)
             self.assertEqual(metadata["errors_this_invocation"], 10)
 
-    def test_empty_export_retries_once_after_warmup(self):
-        calls = []
-
-        def flaky_export(item, destination):
-            calls.append(item.identifier)
-            if len(calls) == 1:
-                raise RuntimeError(
+    def test_failed_export_becomes_a_retryable_record(self):
+        # No inline retry: a failed export is recorded as a retryable "error"
+        # and re-enters pending on the next batch. This is what makes the
+        # removed 20s warm-up retry redundant.
+        with TemporaryDirectory() as temp:
+            run_dir = self._library_run_dir(temp)
+            with mock.patch.object(
+                phototagger, "library_count", return_value=1
+            ), mock.patch.object(
+                phototagger,
+                "library_item_by_id",
+                return_value=make_item("p1", keywords=[]),
+            ), mock.patch.object(
+                phototagger,
+                "export_library_photo_by_id",
+                side_effect=RuntimeError(
                     "Photos export produced 0 candidate still images for p1.jpg"
-                )
-            return Path("/tmp/fake.jpg")
-
-        with mock.patch.object(
-            phototagger, "export_library_photo_by_id", side_effect=flaky_export
-        ), mock.patch.object(phototagger.time, "sleep") as sleep:
-            result = phototagger.export_library_photo_with_warmup_retry(
-                make_item("p1"), Path("/tmp")
+                ),
+            ) as export:
+                result = phototagger.tag_command(self._resume_args(run_dir))
+            self.assertEqual(result, 1)
+            self.assertEqual(export.call_count, 1)  # attempted once, no inline retry
+            latest = phototagger.latest_records_by_photo(
+                phototagger.read_jsonl(run_dir / "results.jsonl")
             )
-        self.assertEqual(result, Path("/tmp/fake.jpg"))
-        self.assertEqual(len(calls), 2)
-        sleep.assert_called_once_with(20)
+            self.assertEqual(latest["p1"]["status"], "error")
+            # "error" is in RETRY_STATUSES, so the photo is still pending.
+            still_pending = phototagger.pending_items(
+                [make_item("p1")], latest
+            )
+            self.assertEqual([i.identifier for i in still_pending], ["p1"])
 
     def test_consecutive_errors_trip_the_circuit_breaker(self):
         # A hung Photos fails every AppleEvent; the batch must stop early with

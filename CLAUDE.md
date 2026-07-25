@@ -75,8 +75,9 @@ eventually wedges into 120s timeouts.
 - Keep **≥ 20 GB free** (comfortably more) before starting a batch. The runner
   watchdog auto-parks the run below 20 GB.
 - "0 candidate still images" means *check free disk first*, not "Photos is cold".
-  The 20s warm-up retry in `export_library_photo_with_warmup_retry` is a
-  leftover from the wrong theory — harmless, but not the real fix.
+  (A 20s inline "warm-up retry" built on the wrong theory was removed on
+  2026-07-25 — a failed export already becomes a retryable `error` record that
+  re-enters pending on the next batch, so the inline stall bought nothing.)
 - Don't manually force iCloud eviction to reclaim space: with Optimize already
   on, macOS evicts under pressure by itself, and the run's downloads immediately
   refill it — you just create download/evict churn.

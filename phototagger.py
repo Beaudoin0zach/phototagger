@@ -822,29 +822,6 @@ def export_photo(album: str, item: PhotoItem, destination: Path) -> Path:
     raise RuntimeError(f"Photos export did not yield an unambiguous still image for {item.filename}")
 
 
-def export_library_photo_with_warmup_retry(item: PhotoItem, destination: Path) -> Path:
-    """Export by id, retrying once after a pause if Photos returned nothing.
-
-    A freshly launched Photos process (the runner restarts it between batches)
-    can briefly answer export requests with zero files before its export
-    subsystem is warm. Observed live: the same photos that exported empty six
-    batches in a row exported fine in 1.3s once Photos had settled.
-    """
-    try:
-        return export_library_photo_by_id(item, destination)
-    except PhotoNotFoundError:
-        raise
-    except RuntimeError as error:
-        if "still image" not in str(error):
-            raise
-        print(
-            "  empty export; waiting 20s for Photos to warm up and retrying",
-            flush=True,
-        )
-        time.sleep(20)
-        return export_library_photo_by_id(item, destination)
-
-
 def set_keywords(album: str, identifier: str, keywords: list[str]) -> None:
     """Exact-list replace; used only by rename-prefix, which needs it."""
     run_applescript(
@@ -1527,7 +1504,7 @@ def run_tag_batch(
                             if stale.is_file():
                                 stale.unlink()
                     image_path = (
-                        export_library_photo_with_warmup_retry(item, item_export_dir)
+                        export_library_photo_by_id(item, item_export_dir)
                         if source_type == "library"
                         else export_photo(album, item, item_export_dir)
                     )
@@ -1541,7 +1518,7 @@ def run_tag_batch(
                 else:
                     with tempfile.TemporaryDirectory(prefix="phototagger-") as temp:
                         image_path = (
-                            export_library_photo_with_warmup_retry(item, Path(temp))
+                            export_library_photo_by_id(item, Path(temp))
                             if source_type == "library"
                             else export_photo(album, item, Path(temp))
                         )
