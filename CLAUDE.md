@@ -73,7 +73,10 @@ eventually wedges into 120s timeouts.
 
 **Implications for anyone working here:**
 - Keep **≥ 20 GB free** (comfortably more) before starting a batch. The runner
-  watchdog auto-parks the run below 20 GB.
+  itself checks free space before every batch and places `STOP` below
+  `MIN_FREE_GB` (20). This lives in `scripts/run_library_batches.py` so it
+  survives session end — an earlier version lived in a supervising shell loop,
+  which silently died with its session and let a run grind down to 18 GB.
 - "0 candidate still images" means *check free disk first*, not "Photos is cold".
   (A 20s inline "warm-up retry" built on the wrong theory was removed on
   2026-07-25 — a failed export already becomes a retryable `error` record that

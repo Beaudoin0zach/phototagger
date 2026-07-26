@@ -118,7 +118,9 @@ returns zero files, and Photos eventually wedges into 120s timeouts.
 So `Photos export produced 0 candidate still images` means **check free disk**,
 not "Photos is cold". An earlier theory blamed sustained AppleEvent load; the
 restart-between-batches machinery came from that theory and treats a symptom.
-The watchdog's 20 GB disk guard is what matches the real cause.
+The runner's own `MIN_FREE_GB` check is what matches the real cause: it runs
+before every batch and places `STOP` when space gets low. If you find a run
+below 20 GB and still going, the runner is an old build — restart it.
 
 If space is tight, look at `~/Library/Metadata/CoreSpotlight` first — a bloated
 search index (pure derived data; macOS rebuilds it) was 74 GB on the MacBook.

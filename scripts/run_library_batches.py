@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import subprocess
 import sys
 import time
@@ -23,6 +24,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 EXIT_PHOTOS_HUNG = 75
 DEFAULT_BATCH_SIZE = 300  # comfortably under the observed ~350-450 hang threshold
+# Every tagged photo pulls its iCloud original down and Photos keeps it, so a
+# long run consumes disk steadily. Below this, exports start returning zero
+# files and Photos eventually wedges (measured: 544 failures/day at 12 GB free,
+# 0 at 64 GB). Park the run rather than grind into that state.
+MIN_FREE_GB = 20
 # Mirrors phototagger.RETRY_STATUSES — a photo whose latest record has one of
 # these is still pending, so it must not count toward a --stop-after target.
 RETRY_STATUSES = {"error", "verify-failed", "write-pending"}
@@ -101,6 +107,11 @@ def restart_photos(*, force: bool) -> bool:
     return wait_for_photos_ready()
 
 
+def free_gb() -> float:
+    stat = os.statvfs("/System/Volumes/Data")
+    return stat.f_bavail * stat.f_frsize / 1_073_741_824
+
+
 def photos_done(run_dir: Path) -> int:
     """Count photos whose LATEST record is a durable, non-retryable status."""
     results = run_dir / "results.jsonl"
@@ -149,6 +160,16 @@ def main() -> int:
     while True:
         if (run_dir / "STOP").exists():
             log("STOP file found; runner paused")
+            return 0
+        available = free_gb()
+        if available < MIN_FREE_GB:
+            # Park rather than starve Photos. Durable by design: this lives in
+            # the runner, not in a supervising shell that dies with a session.
+            (run_dir / "STOP").touch()
+            log(
+                f"only {available:.1f} GB free (< {MIN_FREE_GB} GB); "
+                "STOP placed to protect Photos. Free space, then restart the runner."
+            )
             return 0
         metadata = json.loads(run_file.read_text(encoding="utf-8"))
         if metadata.get("status") == "complete":
