@@ -23,6 +23,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 EXIT_PHOTOS_HUNG = 75
 DEFAULT_BATCH_SIZE = 300  # comfortably under the observed ~350-450 hang threshold
+# Mirrors phototagger.RETRY_STATUSES — a photo whose latest record has one of
+# these is still pending, so it must not count toward a --stop-after target.
+RETRY_STATUSES = {"error", "verify-failed", "write-pending"}
 MAX_CONSECUTIVE_HANG_RESTARTS = 5
 
 
@@ -98,12 +101,38 @@ def restart_photos(*, force: bool) -> bool:
     return wait_for_photos_ready()
 
 
+def photos_done(run_dir: Path) -> int:
+    """Count photos whose LATEST record is a durable, non-retryable status."""
+    results = run_dir / "results.jsonl"
+    if not results.exists():
+        return 0
+    latest = {}
+    with results.open(encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            photo_id = record.get("photo_id")
+            if photo_id:
+                latest[photo_id] = record.get("status")
+    return sum(1 for status in latest.values() if status not in RETRY_STATUSES)
+
+
 def main() -> int:
-    if len(sys.argv) not in (2, 3):
-        print("usage: run_library_batches.py RUN_DIRECTORY [BATCH_SIZE]", file=sys.stderr)
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a.split("=")[0]: a.split("=", 1)[-1] for a in sys.argv[1:] if a.startswith("--")}
+    if len(args) not in (1, 2):
+        print(
+            "usage: run_library_batches.py RUN_DIRECTORY [BATCH_SIZE] [--stop-after=N]",
+            file=sys.stderr,
+        )
         return 2
-    run_dir = Path(sys.argv[1]).resolve()
-    batch_size = int(sys.argv[2]) if len(sys.argv) == 3 else DEFAULT_BATCH_SIZE
+    run_dir = Path(args[0]).resolve()
+    batch_size = int(args[1]) if len(args) == 2 else DEFAULT_BATCH_SIZE
+    stop_after = int(flags["--stop-after"]) if "--stop-after" in flags else None
     run_file = run_dir / "run.json"
     if not run_file.exists():
         print(f"run metadata not found: {run_file}", file=sys.stderr)
@@ -125,6 +154,18 @@ def main() -> int:
         if metadata.get("status") == "complete":
             log("whole-library run complete")
             return 0
+        if stop_after is not None:
+            done = photos_done(run_dir)
+            if done >= stop_after:
+                # Target reached. Park the run so nothing restarts it by
+                # accident; delete STOP and relaunch to continue later.
+                (run_dir / "STOP").touch()
+                log(
+                    f"reached target: {done} photos done (>= {stop_after}); "
+                    "STOP placed, runner exiting"
+                )
+                return 0
+            log(f"{done}/{stop_after} toward target")
         # Preventive restart before every batch: a fresh Photos process stays
         # comfortably under the sustained-load hang threshold.
         if not restart_photos(force=False):
