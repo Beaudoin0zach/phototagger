@@ -283,7 +283,11 @@ def build_vision_prompt(maximum: int, album: str) -> str:
     return f"""Create searchable tags for this personal photo.
 
 Return {maximum} or fewer short, concrete tags. Prefer visible objects, scene,
-setting, activity, colors, and broad categories. Use lower-case singular nouns or
+setting, activity, and colors. Name things as SPECIFICALLY as the image actually
+supports: if you can tell a goose from a duck, or a maple from a tree, use the
+specific name. Only fall back to a general word when the image genuinely does not
+support more precision. Never guess a species or model you cannot clearly see.
+Use lower-case singular nouns or
 short noun phrases. Do not identify people, infer sensitive traits, guess an exact
 location, or add subjective/emotional judgments. The Photos album is named
 {album!r}; treat that only as weak context and never force a tag unsupported by
