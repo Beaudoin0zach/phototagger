@@ -130,6 +130,27 @@ no cloud backup, and its "derived" DBs are cited evidence in `CLAIMS.md`.
 Do not manually force iCloud eviction either — with Optimize already on, macOS
 evicts under pressure by itself and the run's downloads just refill it.
 - `whole-library run complete` — done on this machine.
+- `reached target: N photos done (>= M); STOP placed` — a `--stop-after=M` target was hit. Not a
+  fault. Remove `STOP` and relaunch (with a higher target, or none) to continue.
+- `only N GB free (< 20 GB); STOP placed to protect Photos` — the runner's own disk guard. Free
+  space first; it will re-park immediately otherwise. This lives in the runner, so it survives
+  session end.
+- `batch made no progress (N errors); waiting M min before retry` — normal. Sustained iCloud
+  downloading throttles and exports start returning nothing *even with plenty of disk and a healthy
+  Photos*. Measured 2026-07-27: 300 photos failed "empty export" in a row and all 5 sampled exported
+  fine 3s later. The runner now waits 10 then 20 minutes rather than spending all three strikes in
+  minutes. **Let it wait** — restarting immediately re-enters the throttle.
+
+### A run can be filtered — check before concluding it is stuck
+
+`--only-extensions=CR2` (or similar) narrows a run to certain file types. Progress will look
+frozen for every other type, and that is intentional — excluded photos are **not** marked done, so
+dropping the filter later resumes them. Check how the runner was launched before diagnosing a
+stall:
+
+```bash
+ps -p "$(cat "$run/runner.pid")" -o command=
+```
 
 ## Step 5 — how close are the two fronts to meeting?
 
