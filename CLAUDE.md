@@ -84,9 +84,13 @@ eventually wedges into 120s timeouts.
 - Don't manually force iCloud eviction to reclaim space: with Optimize already
   on, macOS evicts under pressure by itself, and the run's downloads immediately
   refill it — you just create download/evict churn.
-- Do NOT hunt for space in `~/data/public-ledger` (332 GB). It is single-copy
-  with no cloud backup, and its large "derived" DBs are cited evidence in
-  `CLAIMS.md`. See the `public-ledger-depot-single-copy` memory.
+- `~/data/public-ledger` was migrated to the Seagate on 2026-07-27: `federal/`,
+  `state/`, `foreign/` are now **symlinks** to the external drive (272 GB
+  reclaimed); `unmasker/` stays local because it is not re-downloadable. Don't
+  look for more space there — what remains is deliberate. See the
+  `public-ledger-depot-single-copy` memory, and never delete against a backup
+  that hasn't been checksum-verified (that drive had a silently corrupt file
+  with matching size and mtime).
 
 Where the space actually was, when this came up: a bloated **CoreSpotlight index**
 (74 GB → 3 MB; pure derived data, macOS rebuilds it). Check
