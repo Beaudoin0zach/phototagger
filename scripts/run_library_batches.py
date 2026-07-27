@@ -137,13 +137,15 @@ def main() -> int:
     flags = {a.split("=")[0]: a.split("=", 1)[-1] for a in sys.argv[1:] if a.startswith("--")}
     if len(args) not in (1, 2):
         print(
-            "usage: run_library_batches.py RUN_DIRECTORY [BATCH_SIZE] [--stop-after=N]",
+            "usage: run_library_batches.py RUN_DIRECTORY [BATCH_SIZE] "
+            "[--stop-after=N] [--only-extensions=CR2,CR3]",
             file=sys.stderr,
         )
         return 2
     run_dir = Path(args[0]).resolve()
     batch_size = int(args[1]) if len(args) == 2 else DEFAULT_BATCH_SIZE
     stop_after = int(flags["--stop-after"]) if "--stop-after" in flags else None
+    only_ext = flags.get("--only-extensions")
     run_file = run_dir / "run.json"
     if not run_file.exists():
         print(f"run metadata not found: {run_file}", file=sys.stderr)
@@ -203,7 +205,7 @@ def main() -> int:
                 str(run_dir),
                 "--batch-size",
                 str(batch_size),
-            ],
+            ] + (["--only-extensions", only_ext] if only_ext else []),
             check=False,
         )
         metadata = json.loads(run_file.read_text(encoding="utf-8"))

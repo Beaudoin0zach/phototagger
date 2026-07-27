@@ -831,6 +831,40 @@ class ResumeSafetyTests(unittest.TestCase):
             self.assertEqual(latest["p1"]["status"], "applied")
 
 
+class ExtensionFilterTests(unittest.TestCase):
+    def test_filter_selects_only_named_types(self):
+        items = [
+            make_item("a", filename="a.CR2"),
+            make_item("b", filename="b.jpg"),
+            make_item("c", filename="c.cr2"),   # case-insensitive
+            make_item("d", filename="d.HEIC"),
+        ]
+        got = phototagger.pending_items(items, {}, {"cr2"})
+        self.assertEqual([i.identifier for i in got], ["a", "c"])
+
+    def test_no_filter_returns_everything_pending(self):
+        items = [make_item("a", filename="a.CR2"), make_item("b", filename="b.jpg")]
+        self.assertEqual(len(phototagger.pending_items(items, {}, None)), 2)
+        self.assertEqual(len(phototagger.pending_items(items, {}, set())), 2)
+
+    def test_filter_does_not_mark_excluded_photos_done(self):
+        # Excluded photos must stay pending so dropping the filter resumes them.
+        items = [make_item("a", filename="a.CR2"), make_item("b", filename="b.jpg")]
+        latest = {"a": {"photo_id": "a", "status": "applied"}}
+        # with the filter, only CR2 considered — and 'a' is already done
+        self.assertEqual(phototagger.pending_items(items, latest, {"cr2"}), [])
+        # without it, the jpg is still waiting
+        self.assertEqual(
+            [i.identifier for i in phototagger.pending_items(items, latest, None)], ["b"]
+        )
+
+    def test_matches_extensions_handles_dots_and_case(self):
+        self.assertTrue(phototagger.matches_extensions("x.CR2", {"cr2"}))
+        self.assertTrue(phototagger.matches_extensions("x.cr2", {"cr2"}))
+        self.assertFalse(phototagger.matches_extensions("x.jpg", {"cr2"}))
+        self.assertTrue(phototagger.matches_extensions("noext", None))
+
+
 class ChunkedInventoryTests(unittest.TestCase):
     def _fake_batch(self, calls):
         def fake(start, count, order="ascending", timeout=1800):

@@ -1038,16 +1038,35 @@ def latest_records_by_photo(
     return latest
 
 
+def matches_extensions(filename: str, extensions: set[str] | None) -> bool:
+    """True when no filter is set, or the file's extension is in the set."""
+    if not extensions:
+        return True
+    suffix = Path(filename).suffix.lstrip(".").casefold()
+    return suffix in extensions
+
+
 def pending_items(
     items: Iterable[PhotoItem],
     latest_by_photo: dict[str, dict[str, object]],
+    only_extensions: set[str] | None = None,
 ) -> list[PhotoItem]:
+    """Photos still needing work, optionally narrowed to certain file types.
+
+    An extension filter narrows *what this run processes*; it never marks the
+    excluded photos as done, so dropping the filter later resumes them normally.
+    """
     completed = {
         photo_id
         for photo_id, record in latest_by_photo.items()
         if str(record.get("status", "")) not in RETRY_STATUSES
     }
-    return [item for item in items if item.identifier not in completed]
+    return [
+        item
+        for item in items
+        if item.identifier not in completed
+        and matches_extensions(item.filename, only_extensions)
+    ]
 
 
 def verify_applied_batch(
@@ -1290,6 +1309,14 @@ def tag_command(args: argparse.Namespace) -> int:
             metadata["order"] = library_order
         save_run(run_dir, metadata)
 
+    only_extensions = None
+    if getattr(args, "only_extensions", None):
+        only_extensions = {
+            e.strip().lstrip(".").casefold()
+            for e in args.only_extensions.split(",")
+            if e.strip()
+        }
+
     # Serialize against the background runner and any other mutating command
     # operating on this run directory.
     with run_lock(run_dir):
@@ -1308,6 +1335,7 @@ def tag_command(args: argparse.Namespace) -> int:
             model=model,
             batch_size=batch_size,
             library_order=library_order,
+            only_extensions=only_extensions,
         )
 
 
@@ -1327,6 +1355,7 @@ def run_tag_batch(
     model: str,
     batch_size: int,
     library_order: str,
+    only_extensions: set[str] | None = None,
 ) -> int:
     if source_type == "library":
         if library_order not in {"ascending", "descending"}:
@@ -1402,7 +1431,7 @@ def run_tag_batch(
             )
 
     latest_by_photo = latest_records_by_photo(read_jsonl(run_dir / "results.jsonl"))
-    all_pending = pending_items(items, latest_by_photo)
+    all_pending = pending_items(items, latest_by_photo, only_extensions)
     pending = all_pending[:batch_size] if source_type == "library" else all_pending
 
     mode = "APPLY" if apply_changes else "DRY RUN"
@@ -2033,6 +2062,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("ascending", "descending"),
         default="ascending",
         help="whole-library traversal order (default: ascending)",
+    )
+    tag.add_argument(
+        "--only-extensions",
+        default=None,
+        help="process only these file types this run, e.g. CR2,CR3. Excluded "
+        "photos stay pending, so dropping the filter later resumes them.",
     )
     tag.add_argument("--prefix", default="")
     tag.add_argument("--resume", help="existing run directory")
