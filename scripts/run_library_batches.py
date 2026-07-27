@@ -33,6 +33,10 @@ MIN_FREE_GB = 20
 # these is still pending, so it must not count toward a --stop-after target.
 RETRY_STATUSES = {"error", "verify-failed", "write-pending"}
 MAX_CONSECUTIVE_HANG_RESTARTS = 5
+# Sustained iCloud downloading can throttle: exports start returning nothing
+# even with plenty of disk and a healthy Photos. It clears on its own, so wait
+# between no-progress batches instead of spending all three strikes in minutes.
+NO_PROGRESS_BACKOFF_SECONDS = 600
 
 
 def log(message: str) -> None:
@@ -247,10 +251,17 @@ def main() -> int:
                     "stopping for human eyes"
                 )
                 return 1
+            # A batch where everything fails finishes fast, so retrying
+            # immediately just burns the strike count against whatever is
+            # temporarily unhappy. Measured: 300 photos failed "empty export"
+            # in a row, then every one of them exported fine 3s later once
+            # iCloud had a rest. Back off before spending the next strike.
+            backoff = NO_PROGRESS_BACKOFF_SECONDS * no_progress_batches
             log(
                 f"batch made no progress ({errors} error(s)); "
-                f"retrying ({no_progress_batches}/3)"
+                f"waiting {backoff // 60} min before retry ({no_progress_batches}/3)"
             )
+            time.sleep(backoff)
             continue
         log(f"runner stopped after batch error (exit {result.returncode})")
         return result.returncode
