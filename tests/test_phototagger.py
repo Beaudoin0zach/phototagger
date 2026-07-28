@@ -229,14 +229,318 @@ class KeywordTests(unittest.TestCase):
         self.assertEqual(request.get_header("X-api-key"), "test-key")
 
     def test_anthropic_classifier_requires_api_key(self):
-        with mock.patch.dict("os.environ", {}, clear=True):
-            with TemporaryDirectory() as temp:
-                image = Path(temp) / "photo.jpg"
-                image.write_bytes(b"source-image")
-                with self.assertRaises(RuntimeError):
-                    phototagger.classify_with_anthropic(
-                        image, model="claude-sonnet-5", album="Plants", maximum=5
+        with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+            with mock.patch.dict("os.environ", {}, clear=True):
+                with TemporaryDirectory() as temp:
+                    image = Path(temp) / "photo.jpg"
+                    image.write_bytes(b"source-image")
+                    with self.assertRaises(RuntimeError):
+                        phototagger.classify_with_anthropic(
+                            image, model="claude-sonnet-5", album="Plants", maximum=5
+                        )
+
+    @mock.patch.object(phototagger, "image_bytes_for_ollama", return_value=b"fake-image")
+    @mock.patch("urllib.request.urlopen")
+    def test_openai_compatible_classifier_sends_image_and_reads_json_schema(
+        self, urlopen, _image_bytes
+    ):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        response = Response()
+        response.read = lambda: json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "tags": ["houseplant", "green leaf"],
+                                    "determinations": {
+                                        "focus": "not blurry",
+                                        "exposure": "acceptable",
+                                        "orientation": "normal",
+                                        "media_type": "camera photo",
+                                        "text_content": "no text",
+                                        "screenshot_subtype": "none",
+                                        "document_type": "none",
+                                        "special_content": "none",
+                                    },
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+        ).encode()
+        urlopen.return_value = response
+        with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+            with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
+                with TemporaryDirectory() as temp:
+                    image = Path(temp) / "photo.jpg"
+                    image.write_bytes(b"source-image")
+                    values = phototagger.classify_with_openai_compatible(
+                        image, model="gpt-test", album="Plants", maximum=5
                     )
+        self.assertEqual(
+            values["classifications"],
+            [
+                {"label": "houseplant", "confidence": 1.0},
+                {"label": "green leaf", "confidence": 1.0},
+            ],
+        )
+        self.assertEqual(values["determinations"]["focus"], "not blurry")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.full_url, "https://api.openai.com/v1/chat/completions"
+        )
+        payload = json.loads(request.data)
+        self.assertEqual(payload["model"], "gpt-test")
+        self.assertEqual(
+            payload["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/jpeg;base64,ZmFrZS1pbWFnZQ==",
+        )
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+        self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
+        # A 400 cost real debugging time once; these are the params that caused it.
+        self.assertNotIn("temperature", payload)
+        self.assertNotIn("max_tokens", payload)
+
+    @mock.patch.object(phototagger, "image_bytes_for_ollama", return_value=b"fake-image")
+    @mock.patch("urllib.request.urlopen")
+    def test_openai_compatible_uses_custom_api_base(self, urlopen, _image_bytes):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        response = Response()
+        response.read = lambda: json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"tags": ["cat"], "determinations": {}}
+                            )
+                        }
+                    }
+                ]
+            }
+        ).encode()
+        urlopen.return_value = response
+        with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+            with mock.patch.dict("os.environ", {"OPENROUTER_API_KEY": "router-key"}):
+                with TemporaryDirectory() as temp:
+                    image = Path(temp) / "photo.jpg"
+                    image.write_bytes(b"source-image")
+                    values = phototagger.classify_with_openai_compatible(
+                        image,
+                        model="some/model",
+                        album="Plants",
+                        maximum=5,
+                        api_base="https://openrouter.ai/api/v1",
+                    )
+        self.assertEqual(values["classifications"], [{"label": "cat", "confidence": 1.0}])
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.full_url, "https://openrouter.ai/api/v1/chat/completions"
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer router-key")
+
+    @mock.patch.object(phototagger, "image_bytes_for_ollama", return_value=b"fake-image")
+    def test_openai_compatible_requires_api_key_for_remote_hosts(self, _image_bytes):
+        with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+            with mock.patch.dict("os.environ", {}, clear=True):
+                with TemporaryDirectory() as temp:
+                    image = Path(temp) / "photo.jpg"
+                    image.write_bytes(b"source-image")
+                    with self.assertRaisesRegex(RuntimeError, "no API key found"):
+                        phototagger.classify_with_openai_compatible(
+                            image, model="gpt-test", album="Plants", maximum=5
+                        )
+
+    @mock.patch.object(phototagger, "image_bytes_for_ollama", return_value=b"fake-image")
+    @mock.patch("urllib.request.urlopen")
+    def test_openai_compatible_allows_local_endpoint_without_key(
+        self, urlopen, _image_bytes
+    ):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        response = Response()
+        response.read = lambda: json.dumps(
+            {"choices": [{"message": {"content": json.dumps({"tags": [], "determinations": {}})}}]}
+        ).encode()
+        urlopen.return_value = response
+        with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+            with mock.patch.dict("os.environ", {}, clear=True):
+                with TemporaryDirectory() as temp:
+                    image = Path(temp) / "photo.jpg"
+                    image.write_bytes(b"source-image")
+                    phototagger.classify_with_openai_compatible(
+                        image,
+                        model="local-model",
+                        album="Plants",
+                        maximum=5,
+                        api_base="http://localhost:1234/v1",
+                    )
+        request = urlopen.call_args.args[0]
+        self.assertIsNone(request.get_header("Authorization"))
+
+    def test_openai_compatible_reports_non_json_content(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        response = Response()
+        response.read = lambda: json.dumps(
+            {"choices": [{"message": {"content": "I cannot read images."}}]}
+        ).encode()
+        with mock.patch.object(phototagger, "image_bytes_for_ollama", return_value=b"x"):
+            with mock.patch("urllib.request.urlopen", return_value=response):
+                with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+                    with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "k"}):
+                        with TemporaryDirectory() as temp:
+                            image = Path(temp) / "photo.jpg"
+                            image.write_bytes(b"source-image")
+                            with self.assertRaisesRegex(
+                                RuntimeError, "structured output"
+                            ):
+                                phototagger.classify_with_openai_compatible(
+                                    image, model="m", album="Plants", maximum=5
+                                )
+
+
+class BackendCredentialTests(unittest.TestCase):
+    def test_keychain_wins_over_environment(self):
+        with mock.patch.object(phototagger, "keychain_secret", return_value="from-keychain"):
+            with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "from-env"}):
+                key = phototagger.resolve_api_key(
+                    service="phototagger-openai", env_vars=("OPENAI_API_KEY",)
+                )
+        self.assertEqual(key, "from-keychain")
+
+    def test_environment_is_the_fallback(self):
+        with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+            with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "from-env"}):
+                key = phototagger.resolve_api_key(
+                    service="phototagger-openai", env_vars=("OPENAI_API_KEY",)
+                )
+        self.assertEqual(key, "from-env")
+
+    def test_provider_specific_env_var_precedes_the_generic_one(self):
+        with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+            with mock.patch.dict(
+                "os.environ", {"GROQ_API_KEY": "groq", "OPENAI_API_KEY": "generic"}
+            ):
+                key = phototagger.resolve_api_key(
+                    service="phototagger-groq", env_vars=("GROQ_API_KEY", "OPENAI_API_KEY")
+                )
+        self.assertEqual(key, "groq")
+
+    def test_surrounding_whitespace_is_stripped(self):
+        with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+            with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "  sk-abc123\n"}):
+                key = phototagger.resolve_api_key(
+                    service="phototagger-openai", env_vars=("OPENAI_API_KEY",)
+                )
+        self.assertEqual(key, "sk-abc123")
+
+    def test_interior_whitespace_is_rejected_with_a_named_cause(self):
+        # A stray space inside a pasted key produced a 401 that read like a
+        # revoked credential; fail loudly and locally instead.
+        with mock.patch.object(phototagger, "keychain_secret", return_value="sk-ab c123"):
+            with self.assertRaisesRegex(RuntimeError, "whitespace"):
+                phototagger.resolve_api_key(
+                    service="phototagger-openai", env_vars=("OPENAI_API_KEY",)
+                )
+
+    def test_keychain_lookup_failure_is_not_fatal(self):
+        phototagger.keychain_secret.cache_clear()
+        with mock.patch.object(
+            phototagger,
+            "run_command",
+            side_effect=subprocess.CalledProcessError(44, "security"),
+        ):
+            self.assertIsNone(phototagger.keychain_secret("phototagger-absent"))
+        phototagger.keychain_secret.cache_clear()
+
+    def test_missing_key_names_both_sources(self):
+        with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+            with mock.patch.dict("os.environ", {}, clear=True):
+                with self.assertRaises(RuntimeError) as caught:
+                    phototagger.resolve_api_key(
+                        service="phototagger-openai", env_vars=("OPENAI_API_KEY",)
+                    )
+        message = str(caught.exception)
+        self.assertIn("security add-generic-password", message)
+        self.assertIn("OPENAI_API_KEY", message)
+
+    def test_require_backend_credential_fails_before_any_photo_work(self):
+        # A bulk run must not get underway on a key that was never going to work.
+        with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+            with mock.patch.dict("os.environ", {}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "no API key found"):
+                    phototagger.require_backend_credential(
+                        "openai-compatible", "https://api.openai.com/v1"
+                    )
+                with self.assertRaisesRegex(RuntimeError, "no API key found"):
+                    phototagger.require_backend_credential("anthropic", "")
+
+    def test_require_backend_credential_ignores_keyless_backends(self):
+        with mock.patch.object(phototagger, "keychain_secret", return_value=None):
+            with mock.patch.dict("os.environ", {}, clear=True):
+                phototagger.require_backend_credential("ollama", "")
+                phototagger.require_backend_credential("apple", "")
+
+    def test_normalize_api_base_trims_chat_completions_suffix(self):
+        self.assertEqual(
+            phototagger.normalize_api_base("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1",
+        )
+        self.assertEqual(
+            phototagger.normalize_api_base("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1",
+        )
+
+    def test_normalize_api_base_requires_a_scheme(self):
+        with self.assertRaisesRegex(RuntimeError, "scheme"):
+            phototagger.normalize_api_base("api.openai.com/v1")
+
+    def test_provider_slug_names_known_and_unknown_hosts(self):
+        self.assertEqual(phototagger.provider_slug("https://api.openai.com/v1"), "openai")
+        self.assertEqual(
+            phototagger.provider_slug("https://openrouter.ai/api/v1"), "openrouter"
+        )
+        self.assertEqual(phototagger.provider_slug("https://api.groq.com/openai/v1"), "groq")
+        self.assertEqual(
+            phototagger.provider_slug("https://vllm.internal.example.com/v1"), "vllm"
+        )
+        self.assertEqual(phototagger.provider_slug("http://127.0.0.1:1234/v1"), "local")
+
+    def test_strict_schema_drops_keywords_openai_rejects(self):
+        schema = phototagger.openai_strict_schema(phototagger.build_tag_schema(5))
+        self.assertNotIn("maxItems", schema["properties"]["tags"])
+        # The rest of the contract must survive intact.
+        self.assertEqual(schema["required"], ["tags", "determinations"])
+        self.assertFalse(schema["additionalProperties"])
+        self.assertIn("focus", schema["properties"]["determinations"]["properties"])
+        self.assertIn("maxItems", phototagger.build_tag_schema(5)["properties"]["tags"])
 
     def test_determination_keywords_omit_routine_negative_values(self):
         values = phototagger.determination_keywords(
@@ -1143,6 +1447,11 @@ class InfrastructureTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "requires an explicit --model"):
             phototagger.resolve_model("anthropic", None)
+        self.assertEqual(
+            phototagger.resolve_model("openai-compatible", "gpt-test"), "gpt-test"
+        )
+        with self.assertRaisesRegex(RuntimeError, "requires an explicit --model"):
+            phototagger.resolve_model("openai-compatible", None)
 
     def test_rename_prefix_rejects_library_runs(self):
         with TemporaryDirectory() as temp:
