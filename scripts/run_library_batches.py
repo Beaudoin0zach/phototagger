@@ -160,6 +160,23 @@ def main() -> int:
     except BlockingIOError:
         print("another library runner already holds the lock", file=sys.stderr)
         return 1
+    # Photos is a machine-global singleton and this runner force-kills and
+    # relaunches it between batches. The per-run lock above cannot stop a
+    # second runner on a DIFFERENT run directory from doing the same thing
+    # concurrently — each would kill Photos mid-export of the other's batch.
+    # One machine, one Photos-lifecycle manager.
+    photos_lock_path = ROOT / "runs" / ".photos-lifecycle.lock"
+    photos_lock_path.parent.mkdir(parents=True, exist_ok=True)
+    photos_lock = photos_lock_path.open("w")
+    try:
+        fcntl.flock(photos_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(
+            "another runner is already managing the Photos lifecycle on this "
+            "machine; only one runner may be active at a time",
+            file=sys.stderr,
+        )
+        return 1
     phototagger = ROOT / "phototagger.py"
     hang_restarts = 0
     no_progress_batches = 0

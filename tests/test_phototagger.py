@@ -1,6 +1,7 @@
 import argparse
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -1170,6 +1171,52 @@ class FilteredCompletionTests(unittest.TestCase):
             self.assertEqual(result, 0)
             metadata = phototagger.load_run(run_dir)
             self.assertEqual(metadata["status"], "complete")
+
+
+class PrivacyAndLockTests(unittest.TestCase):
+    def test_new_run_directory_is_private(self):
+        with TemporaryDirectory() as temp:
+            run_dir = phototagger.new_run_directory(Path(temp), "My Album")
+            self.assertEqual(run_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_append_jsonl_creates_private_files(self):
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "results.jsonl"
+            phototagger.append_jsonl(path, {"photo_id": "p1"})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_save_run_creates_private_run_json(self):
+        with TemporaryDirectory() as temp:
+            run_dir = Path(temp)
+            phototagger.save_run(run_dir, {"status": "running"})
+            self.assertEqual((run_dir / "run.json").stat().st_mode & 0o777, 0o600)
+
+    def test_run_lock_retrofits_dir_privacy(self):
+        with TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "runs" / "20990101-test"
+            run_dir.mkdir(parents=True)
+            os.chmod(run_dir, 0o755)  # pre-fix world-readable dir
+            with phototagger.run_lock(run_dir):
+                pass
+            self.assertEqual(run_dir.stat().st_mode & 0o777, 0o700)
+
+    def test_runner_photos_lifecycle_lock_is_exclusive(self):
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "rlb_test", MODULE_PATH.parent / "scripts" / "run_library_batches.py"
+        )
+        rlb = ilu.module_from_spec(spec)
+        sys.modules["rlb_test"] = rlb
+        spec.loader.exec_module(rlb)
+        import fcntl as f
+        with TemporaryDirectory() as temp:
+            lock_path = Path(temp) / ".photos-lifecycle.lock"
+            h1 = lock_path.open("w")
+            f.flock(h1, f.LOCK_EX | f.LOCK_NB)
+            h2 = lock_path.open("w")
+            with self.assertRaises(BlockingIOError):
+                f.flock(h2, f.LOCK_EX | f.LOCK_NB)
+            h1.close(); h2.close()
 
 
 class InfrastructureTests(unittest.TestCase):

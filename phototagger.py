@@ -986,10 +986,13 @@ def read_jsonl(path: Path) -> list[dict[str, object]]:
 
 
 def append_jsonl(path: Path, record: dict[str, object]) -> None:
+    is_new = not path.exists()
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+        if is_new:
+            os.fchmod(handle.fileno(), 0o600)
 
 
 def write_review_file(path: Path, records: Iterable[dict[str, object]]) -> None:
@@ -1166,6 +1169,7 @@ def save_run(run_dir: Path, metadata: dict[str, object]) -> None:
         json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    os.chmod(temp, 0o600)
     temp.replace(target)
 
 
@@ -1180,6 +1184,14 @@ def run_lock(run_dir: Path):
     which serializes actual Photos/run.json mutations regardless of who
     launched them.
     """
+    # Best-effort retrofit for run dirs created before private modes existed:
+    # a 0700 directory gates every artifact inside it regardless of file modes.
+    try:
+        os.chmod(run_dir, 0o700)
+        if run_dir.parent.name == "runs":
+            os.chmod(run_dir.parent, 0o700)
+    except OSError:
+        pass
     handle = (run_dir / "command.lock").open("w")
     try:
         try:
@@ -1259,6 +1271,10 @@ def new_run_directory(base: Path, album: str) -> Path:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", album).strip("-") or "album"
     run_dir = base / f"{stamp}-{slug}"
     run_dir.mkdir(parents=True, exist_ok=False)
+    # Run artifacts hold private photo filenames and library identifiers;
+    # keep them out of reach of other local users. chmod (not mkdir mode)
+    # so the result does not depend on the caller's umask.
+    os.chmod(run_dir, 0o700)
     return run_dir
 
 
