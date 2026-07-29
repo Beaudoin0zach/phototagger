@@ -965,16 +965,57 @@ class RollbackTests(unittest.TestCase):
 
     def test_generated_tags_union_covers_applied_and_write_pending(self):
         records = [
-            {"photo_id": "p1", "status": "applied", "generated_keywords": ["plant"]},
+            {"photo_id": "p1", "status": "applied", "generated_keywords": ["plant"],
+             "keywords_before": [], "keywords_after": ["plant"]},
             # A crashed write attempt still counts — the write may have landed.
-            {"photo_id": "p1", "status": "write-pending", "generated_keywords": ["Leaf"]},
-            {"photo_id": "p1", "status": "applied", "generated_keywords": ["leaf", "pot"]},
+            {"photo_id": "p1", "status": "write-pending", "generated_keywords": ["Leaf"],
+             "keywords_before": ["plant"]},
+            {"photo_id": "p1", "status": "applied", "generated_keywords": ["leaf", "pot"],
+             "keywords_before": ["plant", "leaf"], "keywords_after": ["plant", "leaf", "pot"]},
             {"photo_id": "p2", "status": "review", "generated_keywords": ["ignored"]},
-            {"photo_id": "p3", "status": "applied", "generated_keywords": []},
+            {"photo_id": "p3", "status": "applied", "generated_keywords": [],
+             "keywords_before": [], "keywords_after": []},
         ]
         union = phototagger.generated_tags_by_photo(records)
         self.assertEqual(set(union), {"p1"})
         self.assertEqual(union["p1"]["generated_keywords"], ["plant", "Leaf", "pot"])
+
+    def test_rollback_never_removes_pre_existing_user_keywords(self):
+        # P1 regression: the model generated "bird" on a photo the user had
+        # ALREADY hand-tagged "bird". The write was a no-op for that tag, so
+        # rollback must not remove it — only "goose", which this run added.
+        records = [
+            {"photo_id": "p1", "status": "applied",
+             "generated_keywords": ["bird", "goose"],
+             "keywords_before": ["bird", "Vacation"],
+             "keywords_after": ["bird", "Vacation", "goose"]},
+        ]
+        union = phototagger.generated_tags_by_photo(records)
+        self.assertEqual(union["p1"]["generated_keywords"], ["goose"])
+
+    def test_rollback_retry_chain_keeps_our_tag_removable(self):
+        # Attempt 1 added "goose"; the retry's before-list already contains it
+        # (we put it there). The retry contributes nothing, but attempt 1's
+        # record keeps the tag removable — it must not be shielded.
+        records = [
+            {"photo_id": "p1", "status": "applied",
+             "generated_keywords": ["goose"],
+             "keywords_before": [], "keywords_after": ["goose"]},
+            {"photo_id": "p1", "status": "applied",
+             "generated_keywords": ["goose"],
+             "keywords_before": ["goose"], "keywords_after": ["goose"]},
+        ]
+        union = phototagger.generated_tags_by_photo(records)
+        self.assertEqual(union["p1"]["generated_keywords"], ["goose"])
+
+    def test_rollback_write_pending_excludes_pre_existing(self):
+        records = [
+            {"photo_id": "p1", "status": "write-pending",
+             "generated_keywords": ["bird", "goose"],
+             "keywords_before": ["bird"]},
+        ]
+        union = phototagger.generated_tags_by_photo(records)
+        self.assertEqual(union["p1"]["generated_keywords"], ["goose"])
 
     def test_rollback_surgically_removes_only_generated_tags(self):
         with TemporaryDirectory() as temp:
@@ -986,6 +1027,8 @@ class RollbackTests(unittest.TestCase):
                     "filename": "p1.jpg",
                     "status": "applied",
                     "generated_keywords": ["plant", "leaf"],
+                    "keywords_before": ["Family", "vacation"],
+                    "keywords_after": ["Family", "vacation", "plant", "leaf"],
                 },
             )
             removed_calls = []
@@ -1017,6 +1060,8 @@ class RollbackTests(unittest.TestCase):
                     "filename": "p1.jpg",
                     "status": "applied",
                     "generated_keywords": ["plant"],
+                    "keywords_before": [],
+                    "keywords_after": ["plant"],
                 },
             )
             with mock.patch.object(
@@ -1040,6 +1085,8 @@ class RollbackTests(unittest.TestCase):
                     "filename": "p1.jpg",
                     "status": "applied",
                     "generated_keywords": ["plant"],
+                    "keywords_before": [],
+                    "keywords_after": ["plant"],
                 },
             )
             with mock.patch.object(
@@ -1052,6 +1099,77 @@ class RollbackTests(unittest.TestCase):
             audits = list(run_dir.glob("rollback-*.jsonl"))
             audit_records = phototagger.read_jsonl(audits[0])
             self.assertEqual(audit_records[-1]["status"], "not-found")
+
+
+class TornTailTests(unittest.TestCase):
+    def test_torn_final_record_is_dropped_with_warning(self):
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "results.jsonl"
+            phototagger.append_jsonl(path, {"photo_id": "p1", "status": "applied"})
+            phototagger.append_jsonl(path, {"photo_id": "p2", "status": "applied"})
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write('{"photo_id": "p3", "sta')  # crash mid-append
+            records = phototagger.read_jsonl(path)
+            self.assertEqual([r["photo_id"] for r in records], ["p1", "p2"])
+
+    def test_torn_middle_record_still_raises(self):
+        # Mid-file corruption is not a crash signature; silently skipping it
+        # would hide real damage.
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "results.jsonl"
+            with path.open("w", encoding="utf-8") as handle:
+                handle.write('{"photo_id": "p1"\n')  # torn, but NOT last
+                handle.write('{"photo_id": "p2", "status": "applied"}\n')
+            with self.assertRaises(ValueError):
+                phototagger.read_jsonl(path)
+
+
+class FilteredCompletionTests(unittest.TestCase):
+    # P1 regression: exhausting an extension filter must never mark the whole
+    # manifest complete while unfiltered photos still lack records.
+    def _run_dir(self, temp, manifest):
+        run_dir = Path(temp) / "run"
+        run_dir.mkdir()
+        phototagger.save_run(run_dir, {
+            "album": "Photos Library", "apply": True, "backend": "ollama",
+            "batch_size": 25, "confidence": 0.65, "keep_exports": False,
+            "limit": 0, "max_tags": 5, "model": "gemma4:test",
+            "order": "ascending", "prefix": "", "source": "library",
+            "status": "batch_complete", "version": 5,
+        })
+        for photo_id, filename in manifest:
+            phototagger.append_jsonl(run_dir / "manifest.jsonl",
+                {"photo_id": photo_id, "filename": filename, "capture_date": ""})
+        return run_dir
+
+    def test_exhausted_filter_does_not_complete_the_run(self):
+        with TemporaryDirectory() as temp:
+            run_dir = self._run_dir(temp, [("a", "a.CR2"), ("b", "b.jpg")])
+            # the only CR2 is already done; b.jpg has no record at all
+            phototagger.append_jsonl(run_dir / "results.jsonl", {
+                "photo_id": "a", "filename": "a.CR2", "status": "applied",
+                "generated_keywords": ["x"], "keywords_before": [],
+                "keywords_after": ["x"]})
+            with mock.patch.object(phototagger, "library_count", return_value=2):
+                result = phototagger.tag_command(argparse.Namespace(
+                    resume=str(run_dir), batch_size=None, only_extensions="CR2"))
+            self.assertEqual(result, 0)
+            metadata = phototagger.load_run(run_dir)
+            self.assertEqual(metadata["status"], "batch_complete")  # NOT complete
+
+    def test_truly_finished_run_still_completes(self):
+        with TemporaryDirectory() as temp:
+            run_dir = self._run_dir(temp, [("a", "a.CR2")])
+            phototagger.append_jsonl(run_dir / "results.jsonl", {
+                "photo_id": "a", "filename": "a.CR2", "status": "applied",
+                "generated_keywords": ["x"], "keywords_before": [],
+                "keywords_after": ["x"]})
+            with mock.patch.object(phototagger, "library_count", return_value=1):
+                result = phototagger.tag_command(argparse.Namespace(
+                    resume=str(run_dir), batch_size=None, only_extensions="CR2"))
+            self.assertEqual(result, 0)
+            metadata = phototagger.load_run(run_dir)
+            self.assertEqual(metadata["status"], "complete")
 
 
 class InfrastructureTests(unittest.TestCase):

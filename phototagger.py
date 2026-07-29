@@ -956,13 +956,32 @@ def export_library_photo_by_id(item: PhotoItem, destination: Path) -> Path:
 
 
 def read_jsonl(path: Path) -> list[dict[str, object]]:
+    """Read JSONL, tolerating a torn FINAL record.
+
+    append_jsonl flushes+fsyncs per record, so a crash mid-append can tear at
+    most the last line. Dropping that torn tail loses only an in-flight
+    record whose photo simply re-enters pending; refusing to load (the old
+    behavior) made the entire run unresumable. Corruption anywhere else is
+    not a crash signature and still raises.
+    """
     if not path.exists():
         return []
     records = []
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                records.append(json.loads(line))
+    lines = path.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            if all(not later.strip() for later in lines[index + 1:]):
+                print(
+                    f"warning: dropping torn final record in {path.name} "
+                    "(crash mid-append); the affected photo re-enters pending",
+                    file=sys.stderr,
+                )
+                break
+            raise
     return records
 
 
@@ -1436,6 +1455,13 @@ def run_tag_batch(
 
     latest_by_photo = latest_records_by_photo(read_jsonl(run_dir / "results.jsonl"))
     all_pending = pending_items(items, latest_by_photo, only_extensions)
+    # Completion must be judged against the UNFILTERED manifest: an extension
+    # filter narrows what this run processes, never what "complete" means.
+    truly_pending_count = (
+        len(all_pending)
+        if not only_extensions
+        else len(pending_items(items, latest_by_photo, None))
+    )
     pending = all_pending[:batch_size] if source_type == "library" else all_pending
 
     mode = "APPLY" if apply_changes else "DRY RUN"
@@ -1448,6 +1474,15 @@ def run_tag_batch(
         print(f"{mode}: {len(pending)} pending of {len(items)} selected photos in {album!r}")
     print(f"Run directory: {run_dir}")
     if not pending:
+        if truly_pending_count:
+            # The extension filter is exhausted but the manifest is not done.
+            metadata["status"] = "batch_complete"
+            save_run(run_dir, metadata)
+            print(
+                f"Extension filter exhausted; {truly_pending_count} photos outside "
+                "the filter remain pending. Relaunch without --only-extensions to continue."
+            )
+            return 0
         metadata["status"] = "complete"
         metadata["completed_at"] = utc_now()
         save_run(run_dir, metadata)
@@ -1682,11 +1717,11 @@ def run_tag_batch(
         # Only meaningful when error_count == 0: every photo attempted this
         # batch then has a terminal status, so what remains is exactly the
         # pending photos this batch did not reach.
-        remaining = len(all_pending) - len(pending)
+        remaining = truly_pending_count - len(pending)
         if error_count:
             metadata["status"] = "batch_errors"
         else:
-            metadata["status"] = "batch_complete" if remaining else "complete"
+            metadata["status"] = "batch_complete" if remaining > 0 else "complete"
         metadata["last_batch_size"] = len(pending)
         metadata["last_batch_photo_ids"] = [item.identifier for item in pending]
         metadata["last_batch_verified"] = apply_changes and not error_count
@@ -1720,7 +1755,23 @@ def run_tag_batch(
 def generated_tags_by_photo(
     records: Iterable[dict[str, object]],
 ) -> dict[str, dict[str, object]]:
-    """Union of every tag this run ever generated per photo (applied or write-pending).
+    """Per photo, the union of tags this run actually ADDED — never tags that
+    already existed.
+
+    A generated tag that coincided with a pre-existing keyword (the model says
+    "bird"; the user hand-tagged "bird" years ago) was a no-op at write time,
+    so removing it on rollback would delete the user's own keyword. Each
+    record therefore contributes only its own additions:
+
+    - applied: keywords_after − keywords_before (the sync script's atomic
+      read makes these authoritative), intersected with generated_keywords.
+    - write-pending (no authoritative after): generated_keywords −
+      keywords_before. May over-claim only if the crash happened before the
+      write reached Photos, in which case removal is a no-op anyway.
+
+    A retried photo is handled naturally: attempt 1's record contributes the
+    tag it added; attempt 2's before-list already contains it, so attempt 2
+    contributes nothing — but attempt 1's contribution keeps it removable.
 
     write-pending records count because the crash window between the journal
     entry and the applied record means the write may or may not have reached
@@ -1728,7 +1779,21 @@ def generated_tags_by_photo(
     """
     union: dict[str, dict[str, object]] = {}
     for record in records:
-        if str(record.get("status", "")) not in {"applied", "write-pending"}:
+        status = str(record.get("status", ""))
+        if status not in {"applied", "write-pending"}:
+            continue
+        generated = [str(k) for k in record.get("generated_keywords", [])]
+        before_fold = {str(k).casefold() for k in record.get("keywords_before", [])}
+        if status == "applied":
+            after = [str(k) for k in record.get("keywords_after", [])]
+            generated_fold = {g.casefold() for g in generated}
+            added = [
+                k for k in after
+                if k.casefold() not in before_fold and k.casefold() in generated_fold
+            ]
+        else:
+            added = [g for g in generated if g.casefold() not in before_fold]
+        if not added:
             continue
         photo_id = str(record.get("photo_id", ""))
         entry = union.setdefault(
@@ -1740,7 +1805,7 @@ def generated_tags_by_photo(
             },
         )
         entry["generated_keywords"] = merge_keywords(
-            entry["generated_keywords"], record.get("generated_keywords", [])
+            entry["generated_keywords"], added
         )
         entry["filename"] = record.get("filename", entry["filename"])
     return {pid: e for pid, e in union.items() if e["generated_keywords"]}
