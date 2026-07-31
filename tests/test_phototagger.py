@@ -1169,6 +1169,8 @@ class FilteredCompletionTests(unittest.TestCase):
             self.assertEqual(result, 0)
             metadata = phototagger.load_run(run_dir)
             self.assertEqual(metadata["status"], "batch_complete")  # NOT complete
+            # and it parks itself so a guarded runner exits instead of looping
+            self.assertTrue((run_dir / "STOP").exists())
 
     def test_truly_finished_run_still_completes(self):
         with TemporaryDirectory() as temp:

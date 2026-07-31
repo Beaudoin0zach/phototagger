@@ -1522,11 +1522,15 @@ def run_tag_batch(
     if not pending:
         if truly_pending_count:
             # The extension filter is exhausted but the manifest is not done.
+            # Park the run (STOP) so a guarded runner exits instead of looping
+            # no-op batches — each of which would pointlessly restart Photos.
             metadata["status"] = "batch_complete"
             save_run(run_dir, metadata)
+            (run_dir / "STOP").touch()
             print(
                 f"Extension filter exhausted; {truly_pending_count} photos outside "
-                "the filter remain pending. Relaunch without --only-extensions to continue."
+                "the filter remain pending. STOP placed; remove it and relaunch "
+                "without --only-extensions to continue."
             )
             return 0
         metadata["status"] = "complete"
