@@ -319,6 +319,31 @@ class KeywordTests(unittest.TestCase):
         )
         self.assertEqual(values["document_type"], "identification card")
 
+    def test_device_keyword_from_exif_tags_only_iphones(self):
+        # Real iPhone: Apple make + iPhone model, any format (HEIC or old JPG).
+        self.assertEqual(
+            phototagger.device_keyword_from_exif("Apple", "iPhone 6s", prefix=""),
+            "iPhone",
+        )
+        self.assertEqual(
+            phototagger.device_keyword_from_exif(" apple ", "iPhone 13 Pro", prefix=""),
+            "iPhone",
+        )
+        # iPad, Mac, and non-Apple cameras must not be tagged as iPhone.
+        self.assertIsNone(
+            phototagger.device_keyword_from_exif("Apple", "iPad Pro", prefix="")
+        )
+        self.assertIsNone(
+            phototagger.device_keyword_from_exif("Canon", "Canon EOS 5D", prefix="")
+        )
+        # Missing EXIF (a converted or stripped file) yields no tag.
+        self.assertIsNone(phototagger.device_keyword_from_exif("", "", prefix=""))
+        # The keyword prefix is honored, like descriptive/determination tags.
+        self.assertEqual(
+            phototagger.device_keyword_from_exif("Apple", "iPhone SE", prefix="AI: "),
+            "AI: iPhone",
+        )
+
 
 def make_item(identifier, keywords=(), source_index=None, filename=None):
     return phototagger.PhotoItem(

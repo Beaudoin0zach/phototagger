@@ -702,6 +702,46 @@ def merge_keywords(existing: Iterable[str], generated: Iterable[str]) -> list[st
     return merged
 
 
+def device_keyword_from_exif(make: str, model: str, *, prefix: str) -> str | None:
+    """Map EXIF Make/Model to a device keyword, or None.
+
+    iPhone-only for now: the maker is Apple and the model is an iPhone, so
+    iPads, Macs, and non-Apple cameras stay untagged. Pure string logic, kept
+    separate from the subprocess so it can be unit-tested.
+    """
+    if make.strip().casefold() == "apple" and model.strip().casefold().startswith("iphone"):
+        return f"{prefix}iPhone"
+    return None
+
+
+def device_keyword(image_path: Path, *, prefix: str) -> str | None:
+    """Read the photo's EXIF Make/Model and return its device keyword, or None.
+
+    Reads the exported original with ImageMagick (already a hard dependency),
+    so it works for HEIC and JPG alike — older iPhone photos are JPG, and this
+    correctly tags those while skipping iPad/screenshot HEICs. Any read failure
+    yields None: a device tag is a bonus, never a reason to fail a photo.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "magick",
+                "identify",
+                "-format",
+                "%[EXIF:Make]\t%[EXIF:Model]",
+                str(image_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    make, _, model = result.stdout.partition("\t")
+    return device_keyword_from_exif(make, model, prefix=prefix)
+
+
 def rename_generated_keywords(
     current: Iterable[str],
     generated: Iterable[str],
@@ -1012,6 +1052,7 @@ def write_review_file(path: Path, records: Iterable[dict[str, object]]) -> None:
         "generated_keywords",
         "keywords_before",
         "keywords_after",
+        "device",
         "top_predictions",
         "focus",
         "exposure",
@@ -1037,6 +1078,7 @@ def write_review_file(path: Path, records: Iterable[dict[str, object]]) -> None:
                     "generated_keywords": " | ".join(record.get("generated_keywords", [])),
                     "keywords_before": " | ".join(record.get("keywords_before", [])),
                     "keywords_after": " | ".join(record.get("keywords_after", [])),
+                    "device": record.get("device") or "",
                     "top_predictions": " | ".join(
                         f"{item['label']} ({float(item['confidence']):.3f})"
                         for item in record.get("classifications", [])[:10]
@@ -1633,6 +1675,8 @@ def run_tag_batch(
                         album=album,
                         maximum=max_tags,
                     )
+                    # Read EXIF while the export still exists on disk.
+                    device = device_keyword(image_path, prefix=prefix)
                 else:
                     with tempfile.TemporaryDirectory(prefix="phototagger-") as temp:
                         image_path = (
@@ -1647,6 +1691,8 @@ def run_tag_batch(
                             album=album,
                             maximum=max_tags,
                         )
+                        # Read EXIF inside the block, before the temp dir is gone.
+                        device = device_keyword(image_path, prefix=prefix)
                 classifications = list(analysis["classifications"])
                 determinations = refine_determinations(
                     classifications,
@@ -1662,11 +1708,14 @@ def run_tag_batch(
                     descriptive,
                     determination_keywords(determinations, prefix=prefix),
                 )
+                if device:
+                    generated = merge_keywords(generated, [device])
                 record.update(
                     {
                         "classifications": classifications,
                         "determinations": determinations,
                         "generated_keywords": generated,
+                        "device": device,
                     }
                 )
                 if apply_changes and generated:
