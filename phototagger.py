@@ -61,6 +61,11 @@ RETRY_STATUSES = {"error", "verify-failed", "write-pending"}
 # A hung Photos fails every AppleEvent; stop the batch after this many
 # consecutive per-item errors instead of grinding through the rest.
 CONSECUTIVE_ERROR_LIMIT = 8
+# A photo that has failed this many separate attempts is not transient —
+# observed live: 260 photos (mostly UUID-named, originals unavailable in
+# iCloud) each failed 8 times with "empty export" and would have retried
+# forever. Such photos leave pending; coverage reports them as unresolved.
+MAX_ERROR_ATTEMPTS = 5
 # Exit code signalling "Photos appears hung; restart it and resume" — chosen
 # to match EX_TEMPFAIL so the guarded runner can distinguish a recoverable
 # hang from a real error that needs human eyes.
@@ -1072,25 +1077,42 @@ def matches_extensions(filename: str, extensions: set[str] | None) -> bool:
     return suffix in extensions
 
 
+def error_attempts_by_photo(
+    records: Iterable[dict[str, object]],
+) -> dict[str, int]:
+    """How many times each photo has ended an attempt in status "error"."""
+    counts: dict[str, int] = {}
+    for record in records:
+        if str(record.get("status", "")) == "error":
+            photo_id = str(record.get("photo_id", ""))
+            counts[photo_id] = counts.get(photo_id, 0) + 1
+    return counts
+
+
 def pending_items(
     items: Iterable[PhotoItem],
     latest_by_photo: dict[str, dict[str, object]],
     only_extensions: set[str] | None = None,
+    error_attempts: dict[str, int] | None = None,
 ) -> list[PhotoItem]:
     """Photos still needing work, optionally narrowed to certain file types.
 
     An extension filter narrows *what this run processes*; it never marks the
     excluded photos as done, so dropping the filter later resumes them normally.
+    Photos with >= MAX_ERROR_ATTEMPTS failed attempts are excluded as
+    non-transient; coverage reports them as unresolved.
     """
     completed = {
         photo_id
         for photo_id, record in latest_by_photo.items()
         if str(record.get("status", "")) not in RETRY_STATUSES
     }
+    attempts = error_attempts or {}
     return [
         item
         for item in items
         if item.identifier not in completed
+        and attempts.get(item.identifier, 0) < MAX_ERROR_ATTEMPTS
         and matches_extensions(item.filename, only_extensions)
     ]
 
@@ -1469,15 +1491,23 @@ def run_tag_batch(
                 file=sys.stderr,
             )
 
-    latest_by_photo = latest_records_by_photo(read_jsonl(run_dir / "results.jsonl"))
-    all_pending = pending_items(items, latest_by_photo, only_extensions)
+    all_records = read_jsonl(run_dir / "results.jsonl")
+    latest_by_photo = latest_records_by_photo(all_records)
+    error_attempts = error_attempts_by_photo(all_records)
+    all_pending = pending_items(items, latest_by_photo, only_extensions, error_attempts)
     # Completion must be judged against the UNFILTERED manifest: an extension
     # filter narrows what this run processes, never what "complete" means.
     truly_pending_count = (
         len(all_pending)
         if not only_extensions
-        else len(pending_items(items, latest_by_photo, None))
+        else len(pending_items(items, latest_by_photo, None, error_attempts))
     )
+    gave_up = sum(1 for c in error_attempts.values() if c >= MAX_ERROR_ATTEMPTS)
+    if gave_up:
+        print(
+            f"note: {gave_up} photo(s) exceeded {MAX_ERROR_ATTEMPTS} failed attempts "
+            "and are excluded from retry; `coverage` reports them as unresolved"
+        )
     pending = all_pending[:batch_size] if source_type == "library" else all_pending
 
     mode = "APPLY" if apply_changes else "DRY RUN"

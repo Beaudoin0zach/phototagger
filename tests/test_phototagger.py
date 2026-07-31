@@ -859,6 +859,18 @@ class ExtensionFilterTests(unittest.TestCase):
             [i.identifier for i in phototagger.pending_items(items, latest, None)], ["b"]
         )
 
+    def test_photos_exceeding_error_attempts_leave_pending(self):
+        # Observed live: 260 photos with unavailable originals each failed 8
+        # times and would have retried forever, starving the tail of the run.
+        items = [make_item("a"), make_item("b")]
+        latest = {
+            "a": {"photo_id": "a", "status": "error"},
+            "b": {"photo_id": "b", "status": "error"},
+        }
+        attempts = {"a": phototagger.MAX_ERROR_ATTEMPTS, "b": 1}
+        got = phototagger.pending_items(items, latest, None, attempts)
+        self.assertEqual([i.identifier for i in got], ["b"])
+
     def test_matches_extensions_handles_dots_and_case(self):
         self.assertTrue(phototagger.matches_extensions("x.CR2", {"cr2"}))
         self.assertTrue(phototagger.matches_extensions("x.cr2", {"cr2"}))
