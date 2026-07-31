@@ -76,3 +76,27 @@ Searchable history of what went wrong, so patterns across sessions become visibl
   copy been deleted on the strength of that backup, the file would have been lost.
 
 ---
+## Session: 2026-07-31 (RAW completion segment)
+
+**Project:** phototagger
+
+### Failures
+- [runner/filter-exhaust]: exhausted --only-extensions exited 0 with status batch_complete,
+  which the runner read as "keep going" — an infinite loop of no-op batches, each
+  force-restarting Photos (~every 30s). Caught live at the CR2 finish line → exhaustion now
+  places STOP so the runner exits; regression-tested.
+- [diagnosis]: declared ~260 repeatedly-failing UUID-named CR2s "genuinely unavailable —
+  will never succeed" after 8 attempts each → 258 of them subsequently succeeded on further
+  blind retries (very slow iCloud materialization). The attempt-cap stays as a safety valve,
+  but the confident unrecoverability claim was wrong; only 2 of 9,567 truly failed.
+- [watchers]: three overlapping completion watchers accumulated across hibernation
+  recoveries (each re-armed without confirming the prior one died), producing duplicate
+  finish-line notifications → drained; arm-once discipline noted.
+- [tooling]: ran build_index.py with /usr/bin/python3 (3.9) → SyntaxError on modern
+  f-strings; the script was fine, the interpreter was wrong → use PATH python3 (homebrew).
+- [environment]: two battery-death hibernations froze the entire process tree mid-run;
+  the stack thawed intact both times (runner, batch, caffeinate) — logged as a success of
+  the crash design, but the workload out-draining a 100% power bank is a real operational
+  hazard worth remembering.
+
+---

@@ -26,11 +26,17 @@ python3 -m pytest tests/           # or: python3 tests/test_phototagger.py
 - Photos is only ever accessed through its scripting interface; existing keywords are preserved.
 - Every applied run is reversible: `phototagger.py rollback --run runs/<run-id>`.
 
-## Current state (2026-07-25)
+## Current state (2026-07-31)
 - Reconstructed tool; original source was unrecoverable (see `RECOVERY_NOTES.md`).
-- Whole-library `--apply` run in progress: `runs/20260715-193432-Photos-Library/`
-  (descending, manifest-based, ~9.8k of 77,753 done). Migration to the manifest
-  format is **complete** — no further migration step is needed.
+- **RAW archive complete.** The whole-library run `runs/20260715-193432-Photos-Library/`
+  finished its `--only-extensions=CR2` pass: 9,554 of 9,567 CR2 tagged (11
+  not-found, 2 unrecoverable). 23,195 of 77,753 manifest photos have durable
+  records. The run is **parked** (STOP in place); ~54.5k older JPG/HEIC remain
+  pending — resume without the filter to continue. The iMac front is tagging
+  HEIC ascending; its keywords sync via iCloud but its records stay device-local.
+- A completed **bring-your-own-API backend** (OpenAI-compatible adapter,
+  Keychain creds, `test-backend` subcommand) sits unmerged on
+  `origin/claude/angry-jang-97cca4` awaiting review.
 - **Library traversal is manifest + id-based** (v5 runs): a one-time positional
   sweep records every photo id into `run_dir/manifest.jsonl`; all subsequent
   reads/writes address photos purely by id (`media item id ...`, ~0.13s at any
