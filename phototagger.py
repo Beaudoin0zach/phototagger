@@ -53,6 +53,20 @@ IMAGE_EXTENSIONS = {
     ".tiff",
     ".webp",
 } | RAW_EXTENSIONS
+# Videos are classified from a single extracted frame (see extract_video_frame);
+# every other stage — keyword merge, journal, verify, rollback — is identical to
+# a still, because Photos treats keywords the same for both.
+VIDEO_EXTENSIONS = {
+    ".avi",
+    ".m4v",
+    ".mov",
+    ".mp4",
+}
+# How far into a clip to grab the representative frame. Drone and phone footage
+# routinely opens on a black fade-in, a lens cap, or motion blur from takeoff,
+# all of which classify as nothing useful; a tenth of the way in is past that
+# without being deep enough to miss the subject of a short clip.
+VIDEO_FRAME_POSITION = 0.1
 # Statuses that must be retried on resume; anything else counts as completed.
 # "write-pending" is the write-ahead journal entry appended immediately before
 # a Photos mutation: if it is the latest record for a photo, the process died
@@ -747,6 +761,142 @@ def device_keyword(image_path: Path, *, prefix: str) -> str | None:
     return device_keyword_from_exif(make, model, prefix=prefix)
 
 
+def video_duration_seconds(video_path: Path) -> float | None:
+    """Clip length via ffprobe, or None if it cannot be determined."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError:
+        return None
+    return duration if duration > 0 else None
+
+
+def extract_video_frame(video_path: Path, destination: Path) -> Path:
+    """Write one representative frame from a video and return its path.
+
+    Seeks VIDEO_FRAME_POSITION into the clip rather than taking frame 0, which
+    is usually a black fade-in. A clip whose duration ffprobe cannot read falls
+    back to one second in — still past a fade, and safe on a very short clip
+    because ffmpeg clamps a seek beyond the end to the last frame.
+    """
+    duration = video_duration_seconds(video_path)
+    offset = duration * VIDEO_FRAME_POSITION if duration else 1.0
+    frame_path = destination / f"{video_path.stem}-frame.jpg"
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-y",
+                "-ss",
+                f"{offset:.3f}",
+                "-i",
+                str(video_path),
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
+                str(frame_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"could not extract a frame from {video_path.name}") from error
+    # ffmpeg exits 0 having written nothing for a truncated file, so trust the
+    # artifact on disk rather than the return code.
+    if not frame_path.exists() or frame_path.stat().st_size == 0:
+        detail = result.stderr.strip().splitlines()[-1:] or ["no frame written"]
+        raise RuntimeError(f"could not extract a frame from {video_path.name}: {detail[0]}")
+    return frame_path
+
+
+def device_keyword_from_video(video_path: Path, *, prefix: str) -> str | None:
+    """Device keyword for a video, read from its container metadata.
+
+    Videos carry no EXIF, so the maker arrives as a container tag — iPhone
+    footage sets "com.apple.quicktime.make". DJI writes no maker at all: the
+    only brand marker on its MP4s is the per-stream handler name ("DJI.AVC",
+    "DJI.Meta"), so that is treated as the maker when present. Both routes end
+    in the same Make/Model mapping the stills use, keeping the two in lockstep.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format_tags:stream_tags",
+                "-of",
+                "json",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        probe = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    tags = probe.get("format", {}).get("tags", {}) or {}
+    lowered = {str(key).casefold(): str(value) for key, value in tags.items()}
+    make = lowered.get("make") or lowered.get("com.apple.quicktime.make") or ""
+    model = lowered.get("model") or lowered.get("com.apple.quicktime.model") or ""
+    if make:
+        return device_keyword_from_exif(make, model, prefix=prefix)
+    # No maker tag: fall back to the stream handler names. DJI prefixes its
+    # handlers with a control character, so match on a contained "dji." rather
+    # than the start of the string.
+    handlers = [
+        str(stream_tags.get(key, ""))
+        for stream in probe.get("streams", []) or []
+        for stream_tags in [stream.get("tags", {}) or {}]
+        for key in stream_tags
+        if str(key).casefold() == "handler_name"
+    ]
+    if any("dji." in handler.casefold() for handler in handlers):
+        return device_keyword_from_exif("DJI", "", prefix=prefix)
+    return None
+
+
+def prepare_for_classification(media_path: Path, *, prefix: str) -> tuple[Path, str | None]:
+    """Return the image to classify and the device keyword for an export.
+
+    A still is its own classification input; a video yields an extracted frame,
+    with the device read from the movie's container rather than the frame,
+    which ffmpeg writes without any maker metadata.
+    """
+    if media_path.suffix.casefold() in VIDEO_EXTENSIONS:
+        frame_path = extract_video_frame(media_path, media_path.parent)
+        return frame_path, device_keyword_from_video(media_path, prefix=prefix)
+    return media_path, device_keyword(media_path, prefix=prefix)
+
+
 def rename_generated_keywords(
     current: Iterable[str],
     generated: Iterable[str],
@@ -845,8 +995,21 @@ def refine_determinations(
     return refined
 
 
+def media_extensions_for(filename: str) -> set[str]:
+    """Which extensions count as *the* export for this item.
+
+    Keyed on the item's own type so a Live Photo — which exports a .heic AND a
+    .mov — still resolves to the still, while a video item resolves to the
+    movie instead of failing to find any candidate.
+    """
+    if Path(filename).suffix.casefold() in VIDEO_EXTENSIONS:
+        return VIDEO_EXTENSIONS
+    return IMAGE_EXTENSIONS
+
+
 def choose_exported_image(paths: Iterable[Path], expected_filename: str) -> Path:
-    images = [path for path in paths if path.is_file() and path.suffix.casefold() in IMAGE_EXTENSIONS]
+    wanted = media_extensions_for(expected_filename)
+    images = [path for path in paths if path.is_file() and path.suffix.casefold() in wanted]
     if len(images) == 1:
         return images[0]
     exact = [path for path in images if path.name.casefold() == expected_filename.casefold()]
@@ -1124,6 +1287,19 @@ def matches_extensions(filename: str, extensions: set[str] | None) -> bool:
     return suffix in extensions
 
 
+def matches_filenames(filename: str, needles: set[str] | None) -> bool:
+    """True when no filter is set, or the name contains one of the substrings.
+
+    Substring rather than glob: the drone exports this was written for carry
+    two unrelated shapes for the same camera (`DJI_0004.JPG` and
+    `dji_fly_20250819_...jpg`), and one needle catches both.
+    """
+    if not needles:
+        return True
+    name = filename.casefold()
+    return any(needle in name for needle in needles)
+
+
 def error_attempts_by_photo(
     records: Iterable[dict[str, object]],
 ) -> dict[str, int]:
@@ -1141,18 +1317,36 @@ def pending_items(
     latest_by_photo: dict[str, dict[str, object]],
     only_extensions: set[str] | None = None,
     error_attempts: dict[str, int] | None = None,
+    only_filenames: set[str] | None = None,
 ) -> list[PhotoItem]:
-    """Photos still needing work, optionally narrowed to certain file types.
+    """Photos still needing work, optionally narrowed by file type and name.
 
-    An extension filter narrows *what this run processes*; it never marks the
+    Either filter narrows *what this run processes*; neither ever marks the
     excluded photos as done, so dropping the filter later resumes them normally.
+    The two compose (an AND) when both are given.
     Photos with >= MAX_ERROR_ATTEMPTS failed attempts are excluded as
     non-transient; coverage reports them as unresolved.
+
+    A "skipped-unsupported" record is only durable while the type is *still*
+    unsupported. Adding video support turned 202 already-skipped movies into
+    permanently-untagged photos, because that status is not retryable; keying
+    the exclusion on the current supported set re-opens exactly those, and
+    does the same automatically for any type added later.
     """
+    # Materialized because the supported-type lookup below traverses items a
+    # second time; the parameter is an Iterable and may be a generator.
+    items = list(items)
+    supported = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+    by_id = {item.identifier: item for item in items}
     completed = {
         photo_id
         for photo_id, record in latest_by_photo.items()
         if str(record.get("status", "")) not in RETRY_STATUSES
+        and not (
+            str(record.get("status", "")) == "skipped-unsupported"
+            and photo_id in by_id
+            and Path(by_id[photo_id].filename).suffix.casefold() in supported
+        )
     }
     attempts = error_attempts or {}
     return [
@@ -1161,6 +1355,7 @@ def pending_items(
         if item.identifier not in completed
         and attempts.get(item.identifier, 0) < MAX_ERROR_ATTEMPTS
         and matches_extensions(item.filename, only_extensions)
+        and matches_filenames(item.filename, only_filenames)
     ]
 
 
@@ -1425,6 +1620,12 @@ def tag_command(args: argparse.Namespace) -> int:
             if e.strip()
         }
 
+    only_filenames = None
+    if getattr(args, "only_filenames", None):
+        only_filenames = {
+            n.strip().casefold() for n in args.only_filenames.split(",") if n.strip()
+        }
+
     # Serialize against the background runner and any other mutating command
     # operating on this run directory.
     with run_lock(run_dir):
@@ -1444,6 +1645,7 @@ def tag_command(args: argparse.Namespace) -> int:
             batch_size=batch_size,
             library_order=library_order,
             only_extensions=only_extensions,
+            only_filenames=only_filenames,
         )
 
 
@@ -1464,6 +1666,7 @@ def run_tag_batch(
     batch_size: int,
     library_order: str,
     only_extensions: set[str] | None = None,
+    only_filenames: set[str] | None = None,
 ) -> int:
     if source_type == "library":
         if library_order not in {"ascending", "descending"}:
@@ -1541,12 +1744,14 @@ def run_tag_batch(
     all_records = read_jsonl(run_dir / "results.jsonl")
     latest_by_photo = latest_records_by_photo(all_records)
     error_attempts = error_attempts_by_photo(all_records)
-    all_pending = pending_items(items, latest_by_photo, only_extensions, error_attempts)
-    # Completion must be judged against the UNFILTERED manifest: an extension
-    # filter narrows what this run processes, never what "complete" means.
+    all_pending = pending_items(
+        items, latest_by_photo, only_extensions, error_attempts, only_filenames
+    )
+    # Completion must be judged against the UNFILTERED manifest: a filter
+    # narrows what this run processes, never what "complete" means.
     truly_pending_count = (
         len(all_pending)
-        if not only_extensions
+        if not (only_extensions or only_filenames)
         else len(pending_items(items, latest_by_photo, None, error_attempts))
     )
     gave_up = sum(1 for c in error_attempts.values() if c >= MAX_ERROR_ATTEMPTS)
@@ -1561,7 +1766,8 @@ def run_tag_batch(
     if source_type == "library":
         print(
             f"{mode} BATCH: {len(pending)} of {len(all_pending)} pending photos "
-            f"({len(items) - len(all_pending)} of {len(items)} already complete, {library_order})"
+            f"({len(items) - truly_pending_count} of {len(items)} already complete, "
+            f"{library_order})"
         )
     else:
         print(f"{mode}: {len(pending)} pending of {len(items)} selected photos in {album!r}")
@@ -1574,10 +1780,18 @@ def run_tag_batch(
             metadata["status"] = "batch_complete"
             save_run(run_dir, metadata)
             (run_dir / "STOP").touch()
+            flags = " and ".join(
+                flag
+                for flag, active in (
+                    ("--only-extensions", only_extensions),
+                    ("--only-filenames", only_filenames),
+                )
+                if active
+            )
             print(
-                f"Extension filter exhausted; {truly_pending_count} photos outside "
-                "the filter remain pending. STOP placed; remove it and relaunch "
-                "without --only-extensions to continue."
+                f"Filter exhausted; {truly_pending_count} photos outside "
+                f"the filter remain pending. STOP placed; remove it and relaunch "
+                f"without {flags} to continue."
             )
             return 0
         metadata["status"] = "complete"
@@ -1647,7 +1861,9 @@ def run_tag_batch(
                         "capture_date": item.capture_date or record["capture_date"],
                     }
                 )
-            if Path(item.filename).suffix.casefold() not in IMAGE_EXTENSIONS:
+            if Path(item.filename).suffix.casefold() not in (
+                IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+            ):
                 record.update(
                     {
                         "classifications": [],
@@ -1668,10 +1884,16 @@ def run_tag_batch(
                         for stale in item_export_dir.iterdir():
                             if stale.is_file():
                                 stale.unlink()
-                    image_path = (
+                    media_path = (
                         export_library_photo_by_id(item, item_export_dir)
                         if source_type == "library"
                         else export_photo(album, item, item_export_dir)
+                    )
+                    # Videos classify from an extracted frame; stills are their
+                    # own input. Device metadata is read here, while the export
+                    # still exists on disk.
+                    image_path, device = prepare_for_classification(
+                        media_path, prefix=prefix
                     )
                     analysis = classify(
                         image_path,
@@ -1680,14 +1902,17 @@ def run_tag_batch(
                         album=album,
                         maximum=max_tags,
                     )
-                    # Read EXIF while the export still exists on disk.
-                    device = device_keyword(image_path, prefix=prefix)
                 else:
                     with tempfile.TemporaryDirectory(prefix="phototagger-") as temp:
-                        image_path = (
+                        media_path = (
                             export_library_photo_by_id(item, Path(temp))
                             if source_type == "library"
                             else export_photo(album, item, Path(temp))
+                        )
+                        # Frame extraction and the metadata read both happen
+                        # inside the block, before the temp dir is gone.
+                        image_path, device = prepare_for_classification(
+                            media_path, prefix=prefix
                         )
                         analysis = classify(
                             image_path,
@@ -1696,8 +1921,6 @@ def run_tag_batch(
                             album=album,
                             maximum=max_tags,
                         )
-                        # Read EXIF inside the block, before the temp dir is gone.
-                        device = device_keyword(image_path, prefix=prefix)
                 classifications = list(analysis["classifications"])
                 determinations = refine_determinations(
                     classifications,
@@ -1849,7 +2072,11 @@ def run_tag_batch(
         summary += f" and {not_found_count} no-longer-present photo(s)"
     print(f"{summary}. Review {review_path}")
     if source_type == "library" and not error_count:
-        done = len(items) - len(all_pending) + len(pending)
+        # Against the UNFILTERED backlog: all_pending is narrowed by any active
+        # filter, so subtracting it from the whole manifest once reported
+        # "77753 of 77753" after a 54-photo filtered batch, with ~54.5k photos
+        # never processed. Coverage claims in this project have to be exact.
+        done = len(items) - truly_pending_count + len(pending)
         print(f"Library progress: {done} of {len(items)} manifest photos ({library_order})")
     if circuit_broken:
         return EXIT_PHOTOS_HUNG
@@ -2241,6 +2468,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="process only these file types this run, e.g. CR2,CR3. Excluded "
         "photos stay pending, so dropping the filter later resumes them.",
+    )
+    tag.add_argument(
+        "--only-filenames",
+        default=None,
+        help="process only photos whose filename contains one of these "
+        "case-insensitive substrings this run, e.g. DJI,dji_fly. Excluded "
+        "photos stay pending, exactly as with --only-extensions.",
     )
     tag.add_argument("--prefix", default="")
     tag.add_argument("--resume", help="existing run directory")

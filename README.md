@@ -43,6 +43,8 @@ The new implementation is deliberately conservative:
 - macOS with Photos.app
 - Apple command-line developer tools (`swiftc`)
 - ImageMagick (`magick`) for reliable HEIC decoding and orientation
+- ffmpeg (`ffmpeg`, `ffprobe`) — only for tagging videos; still-image runs
+  never invoke it
 - Ollama with `gemma4:e4b-it-qat` (recommended)
 - Python 3.10+
 
@@ -177,11 +179,40 @@ Rename generated keywords from an applied run—for example, remove an earlier
 --max-tags 5        Maximum descriptive tags per image (default: 5).
                     Determination flags such as `screenshot`, `blurry`, or
                     `identification card` are additive on top of this cap.
+--only-extensions   Process only these file types this run, e.g. CR2,CR3.
+                    Excluded photos stay pending, so dropping the filter later
+                    resumes them normally.
+--only-filenames    Process only photos whose filename contains one of these
+                    case-insensitive substrings, e.g. DJI,GOPR. Composes with
+                    --only-extensions as an AND, and excludes photos the same
+                    non-destructive way.
 --prefix "AI: "     Optional prefix for generated keywords (default: none)
 --limit 25          Process at most this many images; 0 means the full album
 --keep-exports      Retain exported image copies for troubleshooting
 --apply             Write merged keywords to Photos
 ```
+
+## Videos
+
+Videos are tagged from a single representative frame: ffmpeg seeks 10% into the
+clip (past the black fade-in that opens most drone and phone footage), extracts
+one JPEG, and that frame runs through the normal classifier. Everything after
+classification — keyword merge, the write-ahead journal, verification, and
+rollback — is identical to a still, because Photos treats keywords the same for
+both.
+
+Device detection differs from stills, which read EXIF. Videos carry the maker in
+container metadata instead: iPhone footage sets `com.apple.quicktime.make`,
+while DJI writes no maker at all and is recognized by its stream handler names
+(`DJI.AVC`, `DJI.Meta`). Both routes end in the same Make/Model mapping the
+stills use.
+
+A truncated video — one missing its `moov` atom, typically a recording or
+transfer cut off mid-write — cannot be decoded at all. ffmpeg exits 0 having
+written nothing in that case, so the extractor checks the file on disk rather
+than the exit code and records a retryable `error` instead of classifying an
+empty frame. File types outside both the image and video sets are still
+recorded as `skipped-unsupported`.
 
 ## Why the old version may have struggled
 

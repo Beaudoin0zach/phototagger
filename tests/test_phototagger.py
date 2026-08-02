@@ -103,6 +103,28 @@ class KeywordTests(unittest.TestCase):
             selected = phototagger.choose_exported_image([still, video], "IMG_1682.HEIC")
             self.assertEqual(selected, still)
 
+    def test_video_item_export_selects_the_movie(self):
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            movie = root / "DJI_0001.MP4"
+            movie.touch()
+            selected = phototagger.choose_exported_image([movie], "DJI_0001.MP4")
+            self.assertEqual(selected, movie)
+
+    def test_media_extensions_keyed_on_the_item_not_the_export(self):
+        # A Live Photo exports a .heic AND a .mov; the still must still win,
+        # which is why the wanted set keys on the item's own filename.
+        self.assertEqual(
+            phototagger.media_extensions_for("IMG_1682.HEIC"),
+            phototagger.IMAGE_EXTENSIONS,
+        )
+        self.assertEqual(
+            phototagger.media_extensions_for("DJI_0001.mp4"),
+            phototagger.VIDEO_EXTENSIONS,
+        )
+
     def test_raw_photo_is_accepted_as_still_image(self):
         from tempfile import TemporaryDirectory
 
@@ -319,6 +341,76 @@ class KeywordTests(unittest.TestCase):
         )
         self.assertEqual(values["document_type"], "identification card")
 
+    def _probe(self, payload):
+        """A fake ffprobe returning the given JSON document."""
+        return mock.Mock(stdout=json.dumps(payload), stderr="", returncode=0)
+
+    def test_device_keyword_from_video_uses_quicktime_maker(self):
+        payload = {
+            "format": {
+                "tags": {
+                    "com.apple.quicktime.make": "Apple",
+                    "com.apple.quicktime.model": "iPhone 13 Pro",
+                }
+            }
+        }
+        with mock.patch.object(phototagger.subprocess, "run", return_value=self._probe(payload)):
+            self.assertEqual(
+                phototagger.device_keyword_from_video(Path("x.mov"), prefix=""),
+                "iPhone",
+            )
+
+    def test_device_keyword_from_video_falls_back_to_dji_stream_handler(self):
+        # Real DJI MP4s carry no maker tag at all — only the handler name,
+        # which is prefixed with a control character.
+        payload = {
+            "format": {"tags": {"major_brand": "avc1"}},
+            "streams": [
+                {"tags": {"handler_name": "DJI.AVC", "language": "eng"}},
+                {"tags": {"handler_name": "DJI.Meta"}},
+            ],
+        }
+        with mock.patch.object(phototagger.subprocess, "run", return_value=self._probe(payload)):
+            self.assertEqual(
+                phototagger.device_keyword_from_video(Path("DJI_0001.MP4"), prefix="AI: "),
+                "AI: Drone",
+            )
+
+    def test_device_keyword_from_video_ignores_unrelated_handlers(self):
+        payload = {
+            "format": {"tags": {}},
+            "streams": [{"tags": {"handler_name": "VideoHandler"}}],
+        }
+        with mock.patch.object(phototagger.subprocess, "run", return_value=self._probe(payload)):
+            self.assertIsNone(
+                phototagger.device_keyword_from_video(Path("x.mp4"), prefix="")
+            )
+
+    def test_device_keyword_from_video_survives_unreadable_file(self):
+        # A truncated video (no moov atom) makes ffprobe emit nothing; a device
+        # tag is a bonus and must never fail the photo.
+        with mock.patch.object(
+            phototagger.subprocess, "run", return_value=mock.Mock(stdout="", stderr="err", returncode=1)
+        ):
+            self.assertIsNone(
+                phototagger.device_keyword_from_video(Path("broken.mp4"), prefix="")
+            )
+
+    def test_extract_video_frame_rejects_a_silently_empty_ffmpeg_run(self):
+        # ffmpeg can exit 0 having written nothing; trust the artifact on disk.
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as temp:
+            with mock.patch.object(
+                phototagger, "video_duration_seconds", return_value=10.0
+            ), mock.patch.object(
+                phototagger.subprocess,
+                "run",
+                return_value=mock.Mock(stdout="", stderr="broken\n", returncode=0),
+            ):
+                with self.assertRaises(RuntimeError):
+                    phototagger.extract_video_frame(Path("v.mp4"), Path(temp))
+
     def test_device_keyword_from_exif_tags_dji_as_drone(self):
         # DJI drones write a bare sensor code as the model, so the maker is
         # the signal — match it whatever the model says, including empty.
@@ -402,6 +494,49 @@ class ResumeSafetyTests(unittest.TestCase):
             "b": {"photo_id": "b", "status": "not-found"},
         }
         pending = phototagger.pending_items(items, latest)
+        self.assertEqual([item.identifier for item in pending], ["a"])
+
+    def test_pending_items_filename_filter_excludes_without_completing(self):
+        items = [
+            make_item("a", filename="DJI_0004.JPG"),
+            make_item("b", filename="IMG_5301.PNG"),
+            make_item("c", filename="dji_fly_20250819_083156_photo.jpg"),
+        ]
+        pending = phototagger.pending_items(items, {}, None, None, {"dji"})
+        self.assertEqual([item.identifier for item in pending], ["a", "c"])
+        # The excluded photo is not marked done — dropping the filter resumes it.
+        self.assertEqual(
+            [item.identifier for item in phototagger.pending_items(items, {})],
+            ["a", "b", "c"],
+        )
+
+    def test_pending_items_reopens_skips_that_are_now_supported(self):
+        items = [
+            make_item("vid", filename="DJI_0001.MP4"),
+            make_item("doc", filename="scan.pdf"),
+        ]
+        latest = {
+            "vid": {"photo_id": "vid", "status": "skipped-unsupported"},
+            "doc": {"photo_id": "doc", "status": "skipped-unsupported"},
+        }
+        pending = phototagger.pending_items(items, latest)
+        # The movie is supported now, so it re-enters; the PDF stays skipped.
+        self.assertEqual([item.identifier for item in pending], ["vid"])
+
+    def test_pending_items_accepts_a_generator(self):
+        items = (
+            make_item(name, filename=f"{name}.jpg") for name in ("a", "b")
+        )
+        pending = phototagger.pending_items(items, {})
+        self.assertEqual([item.identifier for item in pending], ["a", "b"])
+
+    def test_pending_items_filters_compose_as_and(self):
+        items = [
+            make_item("a", filename="DJI_0004.JPG"),
+            make_item("b", filename="DJI_0026.MP4"),
+            make_item("c", filename="IMG_1.JPG"),
+        ]
+        pending = phototagger.pending_items(items, {}, {"jpg"}, None, {"dji"})
         self.assertEqual([item.identifier for item in pending], ["a"])
 
     def test_verify_applied_batch_logs_missing_generated_tags_as_retryable(self):
@@ -925,6 +1060,19 @@ class ExtensionFilterTests(unittest.TestCase):
         attempts = {"a": phototagger.MAX_ERROR_ATTEMPTS, "b": 1}
         got = phototagger.pending_items(items, latest, None, attempts)
         self.assertEqual([i.identifier for i in got], ["b"])
+
+    def test_matches_filenames_is_case_insensitive_substring(self):
+        # One needle catches both drone naming shapes, which is the point.
+        self.assertTrue(phototagger.matches_filenames("DJI_0004.JPG", {"dji"}))
+        self.assertTrue(
+            phototagger.matches_filenames("dji_fly_20250819_083156.jpg", {"dji"})
+        )
+        # Substring, so it matches mid-name too (a renamed export).
+        self.assertTrue(phototagger.matches_filenames("trip-DJI-0004.jpg", {"dji"}))
+        self.assertFalse(phototagger.matches_filenames("IMG_5301.PNG", {"dji"}))
+        # Any needle matching is enough; no filter matches everything.
+        self.assertTrue(phototagger.matches_filenames("GOPR0025.JPG", {"dji", "gopr"}))
+        self.assertTrue(phototagger.matches_filenames("anything.jpg", None))
 
     def test_matches_extensions_handles_dots_and_case(self):
         self.assertTrue(phototagger.matches_extensions("x.CR2", {"cr2"}))
