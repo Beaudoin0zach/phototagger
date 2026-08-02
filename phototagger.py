@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import copy
 import csv
 import fcntl
+import functools
 import json
 import os
 import re
@@ -16,6 +18,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -506,6 +509,117 @@ def classify_with_ollama(
     return shape_vision_result(decoded, maximum, source="Ollama")
 
 
+BACKEND_CHOICES = ("ollama", "openai-compatible", "anthropic", "apple")
+
+DEFAULT_OPENAI_API_BASE = "https://api.openai.com/v1"
+
+# Hosts we can name confidently. Anything else falls back to the first label of
+# the hostname, so a self-hosted endpoint still gets a stable keychain service.
+KNOWN_PROVIDER_HOSTS = {
+    "api.openai.com": "openai",
+    "openrouter.ai": "openrouter",
+    "api.groq.com": "groq",
+    "api.together.xyz": "together",
+    "api.deepinfra.com": "deepinfra",
+    "api.mistral.ai": "mistral",
+    "api.x.ai": "xai",
+    "generativelanguage.googleapis.com": "gemini",
+}
+
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"}
+
+
+def normalize_api_base(api_base: str) -> str:
+    """Accept either a bare base URL or a full chat-completions URL."""
+    base = api_base.strip().rstrip("/")
+    if not base:
+        raise RuntimeError("--api-base cannot be empty")
+    for suffix in ("/chat/completions", "/completions"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    if not urllib.parse.urlsplit(base).scheme:
+        raise RuntimeError(f"--api-base must include a scheme, e.g. https://: {api_base!r}")
+    return base
+
+
+def provider_slug(api_base: str) -> str:
+    """Short, stable name for an endpoint — used for the keychain service name."""
+    host = (urllib.parse.urlsplit(normalize_api_base(api_base)).hostname or "").casefold()
+    if not host:
+        raise RuntimeError(f"--api-base has no host: {api_base!r}")
+    if host in LOCAL_HOSTS:
+        return "local"
+    if host in KNOWN_PROVIDER_HOSTS:
+        return KNOWN_PROVIDER_HOSTS[host]
+    labels = [label for label in host.split(".") if label and label != "api"]
+    return labels[0] if labels else host
+
+
+def is_local_endpoint(api_base: str) -> bool:
+    """Local servers (LM Studio, vLLM, Ollama) usually accept any or no key."""
+    host = (urllib.parse.urlsplit(normalize_api_base(api_base)).hostname or "").casefold()
+    return host in LOCAL_HOSTS
+
+
+@functools.lru_cache(maxsize=None)
+def keychain_secret(service: str) -> str | None:
+    """Read a generic password from the macOS Keychain, or None if absent.
+
+    Deliberately forgiving: a locked keychain, a missing `security` binary, or a
+    denied prompt must not abort a long run, it just means "fall back to the
+    environment". Cached because this is called once per photo.
+    """
+    try:
+        completed = run_command(
+            ["security", "find-generic-password", "-s", service, "-w"],
+            timeout=15,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    secret = completed.stdout.strip()
+    return secret or None
+
+
+def resolve_api_key(
+    *,
+    service: str,
+    env_vars: Iterable[str],
+    required: bool = True,
+    what: str = "this backend",
+) -> str:
+    """Keychain first, then environment. Never reads or writes a plaintext key file.
+
+    The returned key is always stripped: a trailing newline or a space pasted
+    into an env var is invisible and produces a 401 that reads like a bad key.
+    """
+    names = list(dict.fromkeys(env_vars))
+    secret = keychain_secret(service)
+    if not secret:
+        for name in names:
+            candidate = os.environ.get(name, "").strip()
+            if candidate:
+                secret = candidate
+                break
+    secret = (secret or "").strip()
+    if not secret:
+        if not required:
+            return ""
+        exported = " or ".join(names) if names else "an API key environment variable"
+        raise RuntimeError(
+            f"no API key found for {what}. Add one to the macOS Keychain:\n"
+            f"  security add-generic-password -s {service} -a phototagger -w\n"
+            f"(that prompts for the key instead of putting it in your shell history)\n"
+            f"or export {exported}."
+        )
+    if any(character.isspace() for character in secret):
+        raise RuntimeError(
+            f"the API key for {what} contains whitespace, which servers reject as a "
+            "malformed credential (usually a stray space from copy/paste). "
+            f"Re-enter it in the keychain item {service!r} or the environment."
+        )
+    return secret
+
+
 ANTHROPIC_TOOL_NAME = "record_photo_tags"
 
 
@@ -517,11 +631,11 @@ def classify_with_anthropic(
     maximum: int,
     endpoint: str = "https://api.anthropic.com/v1/messages",
 ) -> dict[str, object]:
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set; export it before using --backend anthropic"
-        )
+    api_key = resolve_api_key(
+        service="phototagger-anthropic",
+        env_vars=("ANTHROPIC_API_KEY",),
+        what="--backend anthropic",
+    )
     prompt = build_vision_prompt(maximum, album)
     schema = build_tag_schema(maximum)
     image_bytes = image_bytes_for_ollama(image)
@@ -591,6 +705,182 @@ def classify_with_anthropic(
     return shape_vision_result(decoded, maximum, source="Anthropic")
 
 
+OPENAI_SCHEMA_NAME = "record_photo_tags"
+
+# Keywords OpenAI's strict structured-output mode rejects outright. Dropping
+# them is safe here: shape_vision_result() already truncates to `maximum`, and
+# the prompt states the limit in words.
+OPENAI_UNSUPPORTED_SCHEMA_KEYS = ("maxItems", "minItems", "maxLength", "minLength")
+
+
+def openai_strict_schema(schema: dict[str, object]) -> dict[str, object]:
+    """Copy of the shared schema with keywords strict mode refuses to compile."""
+
+    def strip(node: object) -> object:
+        if isinstance(node, dict):
+            return {
+                key: strip(value)
+                for key, value in node.items()
+                if key not in OPENAI_UNSUPPORTED_SCHEMA_KEYS
+            }
+        if isinstance(node, list):
+            return [strip(item) for item in node]
+        return node
+
+    return strip(copy.deepcopy(schema))  # type: ignore[return-value]
+
+
+def openai_api_key(api_base: str) -> str:
+    """Credential for an OpenAI-compatible endpoint, keyed by provider."""
+    slug = provider_slug(api_base)
+    env_name = re.sub(r"[^A-Z0-9]+", "_", slug.upper()) + "_API_KEY"
+    return resolve_api_key(
+        service=f"phototagger-{slug}",
+        env_vars=(env_name, "OPENAI_API_KEY"),
+        # Local servers (LM Studio, vLLM, Ollama's /v1) ship without auth.
+        required=not is_local_endpoint(api_base),
+        what=f"--backend openai-compatible --api-base {normalize_api_base(api_base)}",
+    )
+
+
+def openai_compatible_request(
+    url: str, payload: dict[str, object] | None, *, api_key: str, timeout: int
+) -> dict[str, object]:
+    """One JSON round-trip, with errors that name the likely cause."""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(
+        url,
+        data=None if payload is None else json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="GET" if payload is None else "POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace").strip()
+        hint = ""
+        if error.code in (401, 403):
+            hint = (
+                " — the endpoint rejected the credential. Check the key itself, "
+                "and that it belongs to this provider."
+            )
+        elif error.code == 404:
+            hint = (
+                " — check --api-base. It should end at /v1, not at "
+                "/v1/chat/completions, and the model must exist on this provider."
+            )
+        elif error.code == 400:
+            hint = (
+                " — the provider rejected the request body. Usually an unknown "
+                "model name, or a parameter this model does not accept."
+            )
+        raise RuntimeError(
+            f"OpenAI-compatible request failed ({error.code}): {detail}{hint}"
+        ) from error
+    except urllib.error.URLError as error:
+        detail = getattr(error, "reason", error)
+        raise RuntimeError(
+            f"OpenAI-compatible request failed: {detail} (is {url} reachable?)"
+        ) from error
+
+
+def list_openai_compatible_models(api_base: str = DEFAULT_OPENAI_API_BASE) -> list[str]:
+    """GET /v1/models, so users can read model names instead of guessing them."""
+    base = normalize_api_base(api_base)
+    result = openai_compatible_request(
+        f"{base}/models", None, api_key=openai_api_key(api_base), timeout=60
+    )
+    entries = result.get("data", result)
+    if not isinstance(entries, list):
+        raise RuntimeError("the provider returned an unexpected /models payload")
+    names = [
+        str(entry.get("id", "")).strip()
+        for entry in entries
+        if isinstance(entry, dict) and str(entry.get("id", "")).strip()
+    ]
+    return sorted(names, key=str.casefold)
+
+
+def classify_with_openai_compatible(
+    image: Path,
+    *,
+    model: str,
+    album: str,
+    maximum: int,
+    api_base: str = DEFAULT_OPENAI_API_BASE,
+    endpoint: str | None = None,
+) -> dict[str, object]:
+    """OpenAI chat-completions shape: covers OpenAI, OpenRouter, Groq, Together,
+    DeepInfra, LM Studio, vLLM, and Ollama's own /v1 endpoint."""
+    base = normalize_api_base(api_base)
+    url = endpoint or f"{base}/chat/completions"
+    api_key = openai_api_key(base)
+    prompt = build_vision_prompt(maximum, album)
+    schema = openai_strict_schema(build_tag_schema(maximum))
+    image_bytes = image_bytes_for_ollama(image)
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
+                    },
+                ],
+            }
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": OPENAI_SCHEMA_NAME,
+                "strict": True,
+                "schema": schema,
+            },
+        },
+    }
+    # Deliberately no `temperature` and no `max_tokens`: several current models
+    # reject one or both outright (400), and the structured-output schema
+    # already pins the response shape. Omitting them is the portable choice.
+    result = openai_compatible_request(url, payload, api_key=api_key, timeout=180)
+    choices = result.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("the provider returned no choices")
+    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+    if not isinstance(message, dict):
+        raise RuntimeError("the provider returned an invalid message payload")
+    refusal = message.get("refusal")
+    if refusal:
+        raise RuntimeError(f"the model refused to classify this image: {refusal}")
+    content = message.get("content", "")
+    if isinstance(content, list):
+        # Some providers return content parts rather than a bare string.
+        content = "".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in (None, "text", "output_text")
+        )
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("the provider returned an empty response body")
+    try:
+        decoded = json.loads(content)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "the provider did not return JSON matching the requested schema; "
+            "this model may not support structured output: "
+            f"{content[:200]}"
+        ) from error
+    if not isinstance(decoded, dict):
+        raise RuntimeError("the provider returned a non-object JSON payload")
+    return shape_vision_result(decoded, maximum, source="OpenAI-compatible")
+
+
 def image_bytes_for_ollama(image: Path) -> bytes:
     """Decode, auto-orient, and resize through ImageMagick for consistent pixels."""
     with tempfile.TemporaryDirectory(prefix="phototagger-ollama-") as temp:
@@ -650,11 +940,20 @@ def classify(
     model: str,
     album: str,
     maximum: int,
+    api_base: str | None = None,
 ) -> dict[str, object]:
     if backend == "ollama":
         return classify_with_ollama(image, model=model, album=album, maximum=maximum)
     if backend == "anthropic":
         return classify_with_anthropic(image, model=model, album=album, maximum=maximum)
+    if backend == "openai-compatible":
+        return classify_with_openai_compatible(
+            image,
+            model=model,
+            album=album,
+            maximum=maximum,
+            api_base=api_base or DEFAULT_OPENAI_API_BASE,
+        )
     return {
         "classifications": classify_with_apple_vision(image),
         "determinations": {
@@ -1543,7 +1842,7 @@ def new_run_directory(base: Path, album: str) -> Path:
 
 
 def resolve_model(backend: str, model: str | None) -> str:
-    """Backend-aware model default; never send an Ollama model name to Anthropic."""
+    """Backend-aware model default; never send an Ollama model name to a remote API."""
     if model:
         return model
     if backend == "ollama":
@@ -1552,7 +1851,25 @@ def resolve_model(backend: str, model: str | None) -> str:
         raise RuntimeError(
             "--backend anthropic requires an explicit --model (e.g. claude-sonnet-5)"
         )
+    if backend == "openai-compatible":
+        raise RuntimeError(
+            "--backend openai-compatible requires an explicit --model; run "
+            "'phototagger test-backend --backend openai-compatible --list-models' "
+            "to see what this provider offers"
+        )
     return ""
+
+
+def require_backend_credential(backend: str, api_base: str) -> None:
+    """Resolve (and validate) an API backend's key without making a request."""
+    if backend == "openai-compatible":
+        openai_api_key(api_base)
+    elif backend == "anthropic":
+        resolve_api_key(
+            service="phototagger-anthropic",
+            env_vars=("ANTHROPIC_API_KEY",),
+            what="--backend anthropic",
+        )
 
 
 def tag_command(args: argparse.Namespace) -> int:
@@ -1569,6 +1886,7 @@ def tag_command(args: argparse.Namespace) -> int:
         limit = int(metadata["limit"])
         backend = str(metadata.get("backend", "apple"))
         model = str(metadata.get("model", ""))
+        api_base = str(metadata.get("api_base", "") or DEFAULT_OPENAI_API_BASE)
         batch_size = (
             int(metadata.get("batch_size", 25))
             if args.batch_size is None
@@ -1589,11 +1907,16 @@ def tag_command(args: argparse.Namespace) -> int:
         limit = args.limit
         backend = args.backend
         model = resolve_model(args.backend, args.model)
+        api_base = normalize_api_base(args.api_base)
         batch_size = args.batch_size if args.batch_size is not None else 25
         library_order = args.order
+        # Before the run directory exists: a credential failure should leave no
+        # half-born run behind for the user to clean up.
+        require_backend_credential(backend, api_base)
         run_dir = new_run_directory(Path(args.runs_dir).resolve(), album)
         metadata = {
             "album": album,
+            "api_base": api_base if backend == "openai-compatible" else "",
             "apply": apply_changes,
             "backend": backend,
             "batch_size": batch_size,
@@ -1611,6 +1934,11 @@ def tag_command(args: argparse.Namespace) -> int:
         if source_type == "library":
             metadata["order"] = library_order
         save_run(run_dir, metadata)
+
+    # Resolve the credential once, before any export or iCloud download. A run
+    # must never get underway on a key that was never going to work. (New runs
+    # were already checked above, ahead of creating the run directory.)
+    require_backend_credential(backend, api_base)
 
     only_extensions = None
     if getattr(args, "only_extensions", None):
@@ -1642,6 +1970,7 @@ def tag_command(args: argparse.Namespace) -> int:
             limit=limit,
             backend=backend,
             model=model,
+            api_base=api_base,
             batch_size=batch_size,
             library_order=library_order,
             only_extensions=only_extensions,
@@ -1665,6 +1994,7 @@ def run_tag_batch(
     model: str,
     batch_size: int,
     library_order: str,
+    api_base: str = DEFAULT_OPENAI_API_BASE,
     only_extensions: set[str] | None = None,
     only_filenames: set[str] | None = None,
 ) -> int:
@@ -1901,6 +2231,7 @@ def run_tag_batch(
                         model=model,
                         album=album,
                         maximum=max_tags,
+                        api_base=api_base,
                     )
                 else:
                     with tempfile.TemporaryDirectory(prefix="phototagger-") as temp:
@@ -1920,6 +2251,7 @@ def run_tag_batch(
                             model=model,
                             album=album,
                             maximum=max_tags,
+                            api_base=api_base,
                         )
                 classifications = list(analysis["classifications"])
                 determinations = refine_determinations(
@@ -2412,6 +2744,115 @@ def run_rename_prefix(
     return 1 if errors else 0
 
 
+def sample_photo_for_test(album: str | None) -> PhotoItem:
+    """One photo to validate a backend against — never mutated, only exported."""
+    if album:
+        items = inventory_album(album)
+        if not items:
+            raise RuntimeError(f"album {album!r} has no photos to test with")
+        return items[0]
+    items = inventory_library_batch(1, 1, "ascending", timeout=300)
+    if not items:
+        raise RuntimeError("the Photos library appears to be empty")
+    return items[0]
+
+
+def test_backend_command(args: argparse.Namespace) -> int:
+    """Classify exactly one photo and print the result.
+
+    This exists so a bad credential or an unsupported parameter costs one API
+    call to discover, not a nine-thousand-photo run. Run it before every bulk
+    run against a new provider, model, or key.
+    """
+    backend = args.backend
+    api_base = normalize_api_base(args.api_base)
+
+    if args.list_models:
+        if backend != "openai-compatible":
+            raise RuntimeError("--list-models only applies to --backend openai-compatible")
+        names = list_openai_compatible_models(api_base)
+        if not names:
+            print("the provider returned no models")
+            return 1
+        print(f"{len(names)} models available at {api_base}:")
+        for name in names:
+            print(f"  {name}")
+        return 0
+
+    model = resolve_model(backend, args.model)
+    album_label = args.album or "Photos Library"
+
+    # Fail on a missing or malformed credential before exporting or converting
+    # anything — that is the whole point of this subcommand.
+    require_backend_credential(backend, api_base)
+
+    if args.image:
+        image_path = Path(args.image).expanduser().resolve()
+        if not image_path.is_file():
+            raise RuntimeError(f"no such image: {image_path}")
+        print(f"Backend: {backend}   Model: {model or '(apple vision)'}")
+        if backend == "openai-compatible":
+            print(f"Endpoint: {api_base}   Credential: {provider_slug(api_base)}")
+        print(f"Photo: {image_path}")
+        analysis = classify(
+            image_path,
+            backend=backend,
+            model=model,
+            album=album_label,
+            maximum=args.max_tags,
+            api_base=api_base,
+        )
+        return report_test_analysis(analysis, args)
+
+    item = sample_photo_for_test(args.album)
+    print(f"Backend: {backend}   Model: {model or '(apple vision)'}")
+    if backend == "openai-compatible":
+        print(f"Endpoint: {api_base}   Credential: {provider_slug(api_base)}")
+    print(f"Photo: {item.filename} ({item.identifier})")
+    with tempfile.TemporaryDirectory(prefix="phototagger-test-") as temp:
+        image_path = (
+            export_photo(args.album, item, Path(temp))
+            if args.album
+            else export_library_photo_by_id(item, Path(temp))
+        )
+        analysis = classify(
+            image_path,
+            backend=backend,
+            model=model,
+            album=album_label,
+            maximum=args.max_tags,
+            api_base=api_base,
+        )
+    return report_test_analysis(analysis, args)
+
+
+def report_test_analysis(analysis: dict[str, object], args: argparse.Namespace) -> int:
+    classifications = list(analysis["classifications"])
+    determinations = refine_determinations(
+        classifications, dict(analysis["determinations"])
+    )
+    descriptive = normalized_tags(
+        classifications, confidence=args.confidence, maximum=args.max_tags, prefix=args.prefix
+    )
+    generated = merge_keywords(
+        descriptive, determination_keywords(determinations, prefix=args.prefix)
+    )
+    print("\nRaw labels:")
+    for entry in classifications:
+        print(f"  {entry['label']} ({float(entry['confidence']):.2f})")
+    print("\nDeterminations:")
+    for key, value in determinations.items():
+        print(f"  {key}: {value}")
+    print("\nKeywords this backend would write:")
+    if generated:
+        for keyword in generated:
+            print(f"  {keyword}")
+    else:
+        print("  (none — nothing passed the confidence filter)")
+    print("\nBackend OK. Nothing was written to Photos.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2425,10 +2866,17 @@ def build_parser() -> argparse.ArgumentParser:
     tag.add_argument("--apply", action="store_true", help="merge generated keywords into Photos")
     tag.add_argument(
         "--backend",
-        choices=("ollama", "anthropic", "apple"),
+        choices=BACKEND_CHOICES,
         default="ollama",
-        help="ollama (default, local Gemma) | anthropic (Claude API, "
-        "needs ANTHROPIC_API_KEY; --model e.g. claude-sonnet-5) | apple (local Vision)",
+        help="ollama (default, local Gemma) | openai-compatible (any provider "
+        "speaking the OpenAI chat API; use --api-base) | anthropic (Claude API) | "
+        "apple (local Vision). Validate with 'test-backend' before a bulk run.",
+    )
+    tag.add_argument(
+        "--api-base",
+        default=DEFAULT_OPENAI_API_BASE,
+        help="base URL for --backend openai-compatible, ending at /v1 "
+        f"(default: {DEFAULT_OPENAI_API_BASE})",
     )
     tag.add_argument(
         "--batch-size",
@@ -2479,6 +2927,37 @@ def build_parser() -> argparse.ArgumentParser:
     tag.add_argument("--prefix", default="")
     tag.add_argument("--resume", help="existing run directory")
     tag.add_argument("--runs-dir", default=str(ROOT / "runs"))
+
+    test_backend = subparsers.add_parser(
+        "test-backend",
+        help="classify ONE photo and print the tags — run this before any bulk run",
+    )
+    test_backend.add_argument(
+        "--backend", choices=BACKEND_CHOICES, default="openai-compatible"
+    )
+    test_backend.add_argument("--model", default=None)
+    test_backend.add_argument(
+        "--api-base",
+        default=DEFAULT_OPENAI_API_BASE,
+        help=f"base URL ending at /v1 (default: {DEFAULT_OPENAI_API_BASE})",
+    )
+    test_backend.add_argument(
+        "--list-models",
+        action="store_true",
+        help="list the provider's model names via GET /v1/models and exit",
+    )
+    test_backend.add_argument(
+        "--image",
+        default=None,
+        help="classify this local image file instead of touching Photos "
+        "(the quickest way to validate a key)",
+    )
+    test_backend.add_argument(
+        "--album", default=None, help="sample the first photo of this album instead of the library"
+    )
+    test_backend.add_argument("--max-tags", type=int, default=5)
+    test_backend.add_argument("--confidence", type=float, default=0.65)
+    test_backend.add_argument("--prefix", default="")
 
     rollback = subparsers.add_parser("rollback", help="restore keywords from an applied run")
     rollback.add_argument("--run", required=True)
@@ -2532,6 +3011,12 @@ def main() -> int:
                     "--max-tags and --batch-size must be positive; --limit cannot be negative"
                 )
             return tag_command(args)
+        if args.command == "test-backend":
+            if args.max_tags < 1:
+                raise RuntimeError("--max-tags must be positive")
+            if not 0.0 <= args.confidence <= 1.0:
+                raise RuntimeError("--confidence must be between 0 and 1")
+            return test_backend_command(args)
         if args.command == "rollback":
             return rollback_command(args)
         if args.command == "coverage":

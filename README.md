@@ -11,7 +11,9 @@ tool was used against the **House plants** album on 2025-12-16.
 
 The new implementation is deliberately conservative:
 
-- classification runs entirely on the Mac with Ollama and Gemma 4 vision;
+- classification runs entirely on the Mac by default, with Ollama and Gemma 4 vision;
+- bring your own API instead if you prefer: any OpenAI-compatible provider or the
+  Claude API, with keys read from the macOS Keychain rather than a plaintext file;
 - Apple's built-in Vision classifier remains available as an offline fallback;
 - dry-run/review mode is the default;
 - Photos is accessed through its supported scripting interface, never by editing
@@ -45,10 +47,12 @@ The new implementation is deliberately conservative:
 - ImageMagick (`magick`) for reliable HEIC decoding and orientation
 - ffmpeg (`ffmpeg`, `ffprobe`) — only for tagging videos; still-image runs
   never invoke it
-- Ollama with `gemma4:e4b-it-qat` (recommended)
+- Ollama with `gemma4:e4b-it-qat` (recommended), **or** an API key for any
+  hosted provider — see [Choosing a backend](#choosing-a-backend)
 - Python 3.10+
 
-No Python packages or API keys are required.
+No Python packages are required. No API key is required for the default local
+backend.
 
 ## Build
 
@@ -56,6 +60,41 @@ No Python packages or API keys are required.
 cd /path/to/PhotoTagger
 ./scripts/build.sh
 ```
+
+## Choosing a backend
+
+PhotoTagger runs classification through one of four backends. Tag quality is the
+whole point of the tool, so pick deliberately.
+
+| Backend | What it is | Key needed | Notes |
+|---|---|---|---|
+| `ollama` (default) | Local Gemma 4 vision via Ollama | none | Good tags, private, slow-ish. **See RAM below.** |
+| `openai-compatible` | Any provider speaking the OpenAI chat API | yes (or none for a local server) | OpenAI, OpenRouter, Groq, Together, DeepInfra, LM Studio, vLLM, Ollama's own `/v1` |
+| `anthropic` | Claude API | yes | Highest tag quality in testing |
+| `apple` | Apple's built-in Vision classifier | none | Compatibility floor only — see below |
+
+`openai-compatible` and `anthropic` send your photos to a third-party API. That
+is a materially different privacy posture from the local-first `ollama` and
+`apple` backends. Decide that before pointing either one at a whole library.
+
+### Local model RAM requirements
+
+Disk size badly understates what a local model needs. Measured here:
+
+| Model | On disk | Resident while running |
+|---|---|---|
+| `gemma4:e4b-it-qat` | 5.7 GB | **~11 GB** |
+
+A 16 GB Mac runs that under heavy memory pressure; an 8 GB Mac cannot run it at
+all. If you have 16 GB and want the machine to stay usable, a hosted backend is
+the better trade.
+
+### About the `apple` backend
+
+Apple's Vision classifier is a compatibility floor, not a real option for a
+searchable library. Its vocabulary is fixed and generic: asked to label a photo
+of a Canada goose, it returned `land, outdoor, grass`. Nothing in that is
+findable later. Use it only when no model backend is available at all.
 
 ## Use
 
@@ -65,6 +104,82 @@ Photos; approve it for Terminal or Codex.
 ```bash
 ./phototagger.py albums
 ```
+
+### Validate a backend before any bulk run
+
+**Always run `test-backend` first when using a new provider, model, or key.** It
+classifies exactly one photo, prints the tags it would write, and touches
+nothing in Photos. A bad key or an unsupported parameter costs one API call to
+find here, versus discovering it partway into a nine-thousand-photo run:
+
+```bash
+./phototagger.py test-backend --backend openai-compatible --model gpt-5-mini
+```
+
+If you are unsure what the provider calls its models, ask it:
+
+```bash
+./phototagger.py test-backend --backend openai-compatible --list-models
+```
+
+To validate a credential without involving Photos at all, point it at any image
+file on disk:
+
+```bash
+./phototagger.py test-backend --backend openai-compatible --model gpt-5-mini --image ~/Desktop/test.jpg
+```
+
+### API keys
+
+Keys are read from the **macOS Keychain first**, then from the environment.
+Never put a key in a plaintext file in this repo.
+
+Add a key to the keychain (this prompts for the value, so it stays out of your
+shell history):
+
+```bash
+security add-generic-password -s phototagger-openai -a phototagger -w
+```
+
+The service name is `phototagger-<provider>`, where the provider is derived from
+`--api-base`: `phototagger-openai`, `phototagger-openrouter`, `phototagger-groq`,
+`phototagger-anthropic`, and so on. `test-backend` prints the provider name it
+resolved, so you can confirm which item it will read.
+
+Environment fallback, checked in order: the provider-specific variable
+(`OPENROUTER_API_KEY`, `GROQ_API_KEY`, …), then `OPENAI_API_KEY`. The
+`anthropic` backend uses `ANTHROPIC_API_KEY`. Keys are stripped of surrounding
+whitespace, and a key containing an interior space is rejected up front rather
+than sent to produce a confusing `401`.
+
+### Non-OpenAI providers
+
+Point `--api-base` at any endpoint ending in `/v1`:
+
+```bash
+# OpenRouter
+./phototagger.py test-backend --backend openai-compatible \
+  --api-base https://openrouter.ai/api/v1 --model qwen/qwen3-vl-235b-a22b-instruct
+
+# LM Studio or vLLM on this machine (no key required)
+./phototagger.py test-backend --backend openai-compatible \
+  --api-base http://localhost:1234/v1 --model local-vision-model
+
+# Ollama's own OpenAI-compatible endpoint
+./phototagger.py test-backend --backend openai-compatible \
+  --api-base http://127.0.0.1:11434/v1 --model gemma4:e4b-it-qat
+```
+
+Once `test-backend` prints sensible tags, use the same flags with `tag`:
+
+```bash
+./phototagger.py tag --album "House plants" --limit 10 \
+  --backend openai-compatible --api-base https://openrouter.ai/api/v1 \
+  --model qwen/qwen3-vl-235b-a22b-instruct
+```
+
+The backend, model, and `--api-base` are saved in `run.json`, so `--resume`
+continues against the same provider without repeating them.
 
 Run a small review-only test. This exports temporary copies for classification
 but does not change the Photos library:
@@ -166,16 +281,21 @@ Rename generated keywords from an applied run—for example, remove an earlier
 --confidence 0.65   Minimum confidence for the apple backend (default: 0.65).
                     Ollama tags always carry confidence 1.0, so this gate only
                     filters Apple Vision classifications.
---backend ollama    Use Gemma 4 locally (default); apple for Apple's classifier;
-                    anthropic to use the Claude API instead (requires
-                    ANTHROPIC_API_KEY; pass --model, e.g. claude-sonnet-5).
-                    anthropic sends photos to a third-party API — a different
-                    privacy posture than the local-first ollama/apple backends.
+--backend ollama    Use Gemma 4 locally (default); openai-compatible for any
+                    provider speaking the OpenAI chat API (pair with --api-base);
+                    anthropic for the Claude API; apple for Apple's classifier.
+                    The two API backends send photos to a third-party service —
+                    a different privacy posture than local-first ollama/apple.
+                    Validate any of them with `test-backend` first.
+--api-base URL      Endpoint for --backend openai-compatible, ending at /v1
+                    (default: https://api.openai.com/v1). A full .../chat/
+                    completions URL is accepted and trimmed.
 --batch-size 25     Whole-library items per verified batch (default: 25).
                     With --resume it overrides the value saved in run.json.
 --order descending  Whole-library traversal direction (default: ascending)
 --model NAME        Vision model. Defaults to gemma4:e4b-it-qat for the ollama
-                    backend; required explicitly for anthropic.
+                    backend; required explicitly for anthropic and
+                    openai-compatible (no silent local default is substituted).
 --max-tags 5        Maximum descriptive tags per image (default: 5).
                     Determination flags such as `screenshot`, `blurry`, or
                     `identification card` are additive on top of this cap.
@@ -223,8 +343,9 @@ video, iCloud originals that must download before export, duplicate filenames,
 Photos automation permissions, and accidental replacement of existing keywords.
 
 This version addresses the operational failures and uses a multimodal model for
-more useful natural-language tags. The Apple Vision fallback is faster but its
-fixed classification vocabulary is more generic.
+more useful natural-language tags. The Apple Vision fallback is faster, but its
+fixed vocabulary is generic enough to be unusable for search — see
+[About the `apple` backend](#about-the-apple-backend).
 
 ## Run artifacts
 

@@ -2,6 +2,46 @@
 
 Searchable history of what went wrong, so patterns across sessions become visible.
 
+## Session: 2026-07-28
+
+**Project:** phototagger (bring-your-own-API backend; restarted the library run)
+
+### Failures
+
+**Read a diagnostic number as the wrong thing (repeat of a known shape)**
+- Reported the check-run skill's progress script as the run's completion figure: **20%**, while the
+  runner's own `APPLY BATCH:` line said **90%**. The script counts only photos *this* machine has a
+  record for; the tool also treats a photo as complete when it already carries generated keywords,
+  including the iMac's work arriving by iCloud. Both numbers were right. Reporting the 20% alone
+  would have read as a stalled run that had lost days. → Fixed in the skill itself: the script's
+  label now says "this machine processed", with a table naming `APPLY BATCH:` as the completion
+  figure. Same family as last session's "0 keyword search results ≠ tagging failure": a query that
+  measures something narrower than the question asked.
+
+**Suspected my own action before checking the timestamp**
+- Found the runner process gone with an Ollama `Remote end closed connection` error in the log, and
+  first suspected the test request I had sent to Ollama. It was ~20 hours earlier and the runner ran
+  ~16 more hours and many batches afterward; the real cause was a system reboot at 08:06:08, twelve
+  seconds after the log's last write. → `sysctl -n kern.boottime` settles "did the machine restart"
+  in one command and should be the first check when a long-running background job vanishes.
+
+**Self-caught code defects (found by exercising the CLI, not by tests)**
+- Put the `tag` credential pre-check *after* `new_run_directory()`, so a missing-key failure left an
+  orphaned run directory behind → moved it ahead of directory creation; verified no directory is
+  created on failure.
+- Built the missing-key message from a provider-derived env var plus a generic fallback, which
+  collapse to the same name for OpenAI: "export OPENAI_API_KEY or OPENAI_API_KEY" → deduped with
+  `dict.fromkeys`. Both defects were invisible to the unit tests and surfaced only from running the
+  actual command and reading its output.
+
+**Environment / tooling**
+- `sleep 45 && <checks>` was blocked by the harness → used a backgrounded `until` loop instead.
+- CLAUDE.md documents `python3 -m pytest tests/`, but pytest is not installed for the active
+  Python 3.14; only `python3 tests/test_phototagger.py` works. Not fixed here — the correction
+  belongs on `main`, not on this feature branch.
+
+---
+
 ## Session: 2026-07-27
 
 **Project:** phototagger (whole-library tagging run, depot migration, app design)

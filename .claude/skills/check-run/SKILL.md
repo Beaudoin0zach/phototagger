@@ -61,9 +61,34 @@ for line in (run/"results.jsonl").open() if (run/"results.jsonl").exists() else 
 done = {pid for pid, st in latest.items() if st not in retry}
 total = m.get("manifest_total", 0)
 print(f"status={m.get('status')} order={m.get('order')}")
-print(f"progress: {len(done)}/{total} photos ({100*len(done)/total:.1f}%)" if total else "no manifest yet")
+print(f"this machine processed: {len(done)}/{total} photos ({100*len(done)/total:.1f}%)" if total else "no manifest yet")
 print(f"last invocation: applied={m.get('applied_this_invocation')} errors={m.get('errors_this_invocation')}")
 PY
+```
+
+### This number is NOT the run's completion percentage — do not report it as one
+
+It counts only photos **this machine** has a record for in `results.jsonl`. The
+tool's own pending calculation also treats a photo as complete when it already
+carries generated keywords in Photos — including keywords the *other* machine
+applied, which arrive here by iCloud sync. So the two numbers diverge widely and
+both are correct:
+
+| number | where to read it | what it means |
+|---|---|---|
+| `N of M already complete` | the `APPLY BATCH:` line in `runner.log` | what the tool will actually skip — **this is the completion figure** |
+| the script above | `results.jsonl` | photos this machine personally classified |
+
+Measured 2026-07-28 on the MacBook run: the script reported **15,548 (20%)**
+while the runner log's own line read **70,084 of 77,753 already complete (90%)**.
+Nothing was wrong — the iMac's ascending front had covered the difference and
+iCloud had synced it. Reporting the 20% would have looked like a stalled run
+that had lost four days of work.
+
+**So always read the completion figure off the newest `APPLY BATCH:` line:**
+
+```bash
+grep "APPLY BATCH:" "$run/runner.log" | tail -1
 ```
 
 `run.json` `status` values and what they mean:
