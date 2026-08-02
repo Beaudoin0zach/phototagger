@@ -705,12 +705,17 @@ def merge_keywords(existing: Iterable[str], generated: Iterable[str]) -> list[st
 def device_keyword_from_exif(make: str, model: str, *, prefix: str) -> str | None:
     """Map EXIF Make/Model to a device keyword, or None.
 
-    iPhone-only for now: the maker is Apple and the model is an iPhone, so
-    iPads, Macs, and non-Apple cameras stay untagged. Pure string logic, kept
-    separate from the subprocess so it can be unit-tested.
+    Two devices for now, so iPads, Macs, and other cameras stay untagged:
+    Apple + an iPhone model, and any DJI-made camera (the drones write
+    Make=DJI with a bare sensor code like "FC3411" for the model, so the
+    maker alone is the reliable signal). Pure string logic, kept separate
+    from the subprocess so it can be unit-tested.
     """
-    if make.strip().casefold() == "apple" and model.strip().casefold().startswith("iphone"):
+    make_key = make.strip().casefold()
+    if make_key == "apple" and model.strip().casefold().startswith("iphone"):
         return f"{prefix}iPhone"
+    if make_key == "dji" or make_key.startswith("dji "):
+        return f"{prefix}Drone"
     return None
 
 

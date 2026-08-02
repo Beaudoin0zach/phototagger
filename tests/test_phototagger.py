@@ -319,6 +319,36 @@ class KeywordTests(unittest.TestCase):
         )
         self.assertEqual(values["document_type"], "identification card")
 
+    def test_device_keyword_from_exif_tags_dji_as_drone(self):
+        # DJI drones write a bare sensor code as the model, so the maker is
+        # the signal — match it whatever the model says, including empty.
+        self.assertEqual(
+            phototagger.device_keyword_from_exif("DJI", "FC3411", prefix=""),
+            "Drone",
+        )
+        self.assertEqual(
+            phototagger.device_keyword_from_exif(" dji ", "", prefix=""),
+            "Drone",
+        )
+        self.assertEqual(
+            phototagger.device_keyword_from_exif("DJI", "FC220", prefix="AI: "),
+            "AI: Drone",
+        )
+        # Variant maker strings still count; a word merely beginning in the
+        # same letters (Djibouti-something) does not.
+        self.assertEqual(
+            phototagger.device_keyword_from_exif("DJI Innovations", "FC7303", prefix=""),
+            "Drone",
+        )
+        self.assertIsNone(
+            phototagger.device_keyword_from_exif("Djitech", "X100", prefix="")
+        )
+        # Hasselblad-branded DJI payloads (Mavic 2 Pro) are NOT caught here —
+        # they report Make=Hasselblad. Documented, not silently assumed away.
+        self.assertIsNone(
+            phototagger.device_keyword_from_exif("Hasselblad", "L1D-20c", prefix="")
+        )
+
     def test_device_keyword_from_exif_tags_only_iphones(self):
         # Real iPhone: Apple make + iPhone model, any format (HEIC or old JPG).
         self.assertEqual(
