@@ -112,6 +112,57 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class PhotosTimeoutError(RuntimeError):
+    """Photos hung or its AppleEvent timed out — the hang-circuit signature.
+
+    A distinct type, not a message substring: backend stalls (Ollama, hosted
+    APIs) also stringify to "timed out", and matching on the text once made an
+    API stall force-restart Photos for a problem Photos didn't have.
+    """
+
+
+# Transient HTTP statuses worth an in-process retry before burning the photo's
+# error budget: rate limits (429), server-side blips (5xx), and Anthropic's
+# overloaded signal (529). Auth and client errors fail fast — retrying a bad
+# key or an unknown model just delays a clear message.
+TRANSIENT_HTTP_STATUSES = {408, 429, 500, 502, 503, 504, 529}
+
+
+def urlopen_json_with_retry(
+    request: urllib.request.Request,
+    *,
+    timeout: int,
+    retries: int = 2,
+) -> dict[str, object]:
+    """urlopen + JSON parse, retrying transient failures with backoff.
+
+    Retries only what a wait can fix (TRANSIENT_HTTP_STATUSES and URLError —
+    connection resets, DNS blips, socket timeouts); everything else raises
+    immediately for the caller's per-backend error translation. Without this,
+    every 429 in a hosted-API run cost one of the photo's five lifetime error
+    attempts — an environmental burst could permanently exclude photos.
+    """
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code not in TRANSIENT_HTTP_STATUSES or attempt >= retries:
+                raise
+            error.read()  # drain so the connection can be reused
+        except urllib.error.URLError:
+            if attempt >= retries:
+                raise
+        delay = (5, 20, 60)[min(attempt, 2)]
+        print(
+            f"transient API failure; retrying in {delay}s ({attempt + 1}/{retries})",
+            file=sys.stderr,
+            flush=True,
+        )
+        time.sleep(delay)
+    raise RuntimeError("retry loop ended unexpectedly")
+
+
 def run_command(command: list[str], *, timeout: int = 600) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
@@ -138,7 +189,7 @@ def run_applescript(
             # up) — distinct from the -1712 case below, where Photos itself
             # reports the AppleEvent timeout and returns promptly.
             if attempt >= retries:
-                raise RuntimeError(
+                raise PhotosTimeoutError(
                     f"Photos automation timed out after {timeout}s running {name}"
                 ) from error
             delay = (5, 15, 30)[attempt]
@@ -157,6 +208,13 @@ def run_applescript(
             # anything else (wrong id, missing album, etc.) is a real error.
             retryable = "(-1712)" in detail or "(-609)" in detail
             if not retryable or attempt >= retries:
+                # -1712 exhausted is Photos reporting its own AppleEvent
+                # timeout — the same wedged-Photos signature as a hard hang,
+                # so it carries the same type for the circuit breaker.
+                if "(-1712)" in detail:
+                    raise PhotosTimeoutError(
+                        f"Photos automation failed: {detail}"
+                    ) from error
                 raise RuntimeError(f"Photos automation failed: {detail}") from error
             delay = (5, 15, 30)[attempt]
             print(
@@ -496,8 +554,7 @@ def classify_with_ollama(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=900) as response:
-            result = json.load(response)
+        result = urlopen_json_with_retry(request, timeout=900)
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"Ollama request failed ({error.code}): {detail}") from error
@@ -567,14 +624,34 @@ def keychain_secret(service: str) -> str | None:
 
     Deliberately forgiving: a locked keychain, a missing `security` binary, or a
     denied prompt must not abort a long run, it just means "fall back to the
-    environment". Cached because this is called once per photo.
+    environment". Cached because this is called once per photo — which also
+    means a transient failure pins None for the whole process, so any failure
+    other than plain item-not-found warns once on stderr instead of silently
+    switching credential sources for the rest of the run.
     """
     try:
         completed = run_command(
             ["security", "find-generic-password", "-s", service, "-w"],
             timeout=15,
         )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+    except subprocess.CalledProcessError as error:
+        if error.returncode != 44:  # 44 = errSecItemNotFound: a plain absence
+            print(
+                f"warning: keychain lookup for {service!r} failed "
+                f"(security exited {error.returncode}, e.g. locked keychain or "
+                "denied prompt); falling back to the environment for the rest "
+                "of this run",
+                file=sys.stderr,
+                flush=True,
+            )
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError) as error:
+        print(
+            f"warning: keychain lookup for {service!r} failed ({error!r}); "
+            "falling back to the environment for the rest of this run",
+            file=sys.stderr,
+            flush=True,
+        )
         return None
     secret = completed.stdout.strip()
     return secret or None
@@ -681,8 +758,7 @@ def classify_with_anthropic(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
-            result = json.load(response)
+        result = urlopen_json_with_retry(request, timeout=180)
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"Anthropic request failed ({error.code}): {detail}") from error
@@ -757,8 +833,7 @@ def openai_compatible_request(
         method="GET" if payload is None else "POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.load(response)
+        return urlopen_json_with_retry(request, timeout=timeout)
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace").strip()
         hint = ""
@@ -1602,12 +1677,32 @@ def matches_filenames(filename: str, needles: set[str] | None) -> bool:
 def error_attempts_by_photo(
     records: Iterable[dict[str, object]],
 ) -> dict[str, int]:
-    """How many times each photo has ended an attempt in status "error"."""
+    """CONSECUTIVE trailing errors per photo — any other status resets to zero.
+
+    Deliberately not a lifetime tally. Environmental failures arrive in
+    batch-wide bursts (the disk-full day produced 544 empty-export errors;
+    a hosted API can 429 a whole batch), and a cumulative count charged every
+    affected photo's permanent exclusion budget for problems that weren't the
+    photo's: this library already has 278 photos with >= 5 lifetime errors, of
+    which 276 later applied fine. A photo now only exhausts its
+    MAX_ERROR_ATTEMPTS budget by failing that many separate attempts in a row
+    with no success between them — the signature of a genuinely bad photo
+    rather than a bad day.
+    """
     counts: dict[str, int] = {}
     for record in records:
-        if str(record.get("status", "")) == "error":
-            photo_id = str(record.get("photo_id", ""))
+        photo_id = str(record.get("photo_id", ""))
+        if not photo_id:
+            continue
+        status = str(record.get("status", ""))
+        if status == "error":
             counts[photo_id] = counts.get(photo_id, 0) + 1
+        elif status != "write-pending":
+            # write-pending is journaled intent BEFORE the Photos write, not an
+            # outcome — if it reset the streak, a photo failing at the write
+            # step would alternate write-pending/error forever and never
+            # exhaust its budget.
+            counts[photo_id] = 0
     return counts
 
 
@@ -1617,14 +1712,20 @@ def pending_items(
     only_extensions: set[str] | None = None,
     error_attempts: dict[str, int] | None = None,
     only_filenames: set[str] | None = None,
+    apply_changes: bool = False,
 ) -> list[PhotoItem]:
     """Photos still needing work, optionally narrowed by file type and name.
 
     Either filter narrows *what this run processes*; neither ever marks the
     excluded photos as done, so dropping the filter later resumes them normally.
     The two compose (an AND) when both are given.
-    Photos with >= MAX_ERROR_ATTEMPTS failed attempts are excluded as
-    non-transient; coverage reports them as unresolved.
+    Photos with >= MAX_ERROR_ATTEMPTS consecutive failed attempts are excluded
+    as non-transient; coverage reports them as unresolved.
+
+    A "review" record is a completed DRY-RUN, so under apply_changes it counts
+    as pending again — otherwise resuming a dry-run directory with --apply
+    would write nothing and report the run complete, a silent no-op that looks
+    like success.
 
     A "skipped-unsupported" record is only durable while the type is *still*
     unsupported. Adding video support turned 202 already-skipped movies into
@@ -1641,6 +1742,7 @@ def pending_items(
         photo_id
         for photo_id, record in latest_by_photo.items()
         if str(record.get("status", "")) not in RETRY_STATUSES
+        and not (apply_changes and str(record.get("status", "")) == "review")
         and not (
             str(record.get("status", "")) == "skipped-unsupported"
             and photo_id in by_id
@@ -2075,20 +2177,30 @@ def run_tag_batch(
     latest_by_photo = latest_records_by_photo(all_records)
     error_attempts = error_attempts_by_photo(all_records)
     all_pending = pending_items(
-        items, latest_by_photo, only_extensions, error_attempts, only_filenames
+        items,
+        latest_by_photo,
+        only_extensions,
+        error_attempts,
+        only_filenames,
+        apply_changes=apply_changes,
     )
     # Completion must be judged against the UNFILTERED manifest: a filter
     # narrows what this run processes, never what "complete" means.
     truly_pending_count = (
         len(all_pending)
         if not (only_extensions or only_filenames)
-        else len(pending_items(items, latest_by_photo, None, error_attempts))
+        else len(
+            pending_items(
+                items, latest_by_photo, None, error_attempts, apply_changes=apply_changes
+            )
+        )
     )
     gave_up = sum(1 for c in error_attempts.values() if c >= MAX_ERROR_ATTEMPTS)
     if gave_up:
         print(
-            f"note: {gave_up} photo(s) exceeded {MAX_ERROR_ATTEMPTS} failed attempts "
-            "and are excluded from retry; `coverage` reports them as unresolved"
+            f"note: {gave_up} photo(s) failed {MAX_ERROR_ATTEMPTS} consecutive "
+            "attempts with no success between and are excluded from retry; "
+            "`coverage` reports them as unresolved"
         )
     pending = all_pending[:batch_size] if source_type == "library" else all_pending
 
@@ -2320,11 +2432,13 @@ def run_tag_batch(
             print("  photo no longer in the library", flush=True)
         except Exception as error:  # continue so one iCloud/export failure does not lose the run
             error_count += 1
-            # Only timeout-signature errors indicate a wedged Photos and count
-            # toward the hang circuit breaker. Ordinary per-item failures
-            # (export produced nothing, decode errors, ...) are recorded as
-            # retryable and must never trigger a Photos restart loop.
-            if "timed out" in str(error):
+            # Only PHOTOS timeouts indicate a wedged Photos and count toward
+            # the hang circuit breaker — matched by type, not message text,
+            # because a stalled backend (Ollama, hosted API) also stringifies
+            # to "timed out" and once made the runner restart Photos for a
+            # problem Photos didn't have. Ordinary per-item failures are
+            # recorded as retryable and must never trigger a restart loop.
+            if isinstance(error, PhotosTimeoutError):
                 consecutive_errors += 1
             else:
                 consecutive_errors = 0
@@ -2370,7 +2484,7 @@ def run_tag_batch(
                 # rather than crashing before metadata is saved — every
                 # per-item result is already durable in results.jsonl.
                 error_count += 1
-                if "timed out" in str(error):
+                if isinstance(error, PhotosTimeoutError):
                     circuit_broken = True  # hang signature; runner may restart Photos
                 print(f"  VERIFICATION ERROR: {error}", file=sys.stderr)
         # Only meaningful when error_count == 0: every photo attempted this

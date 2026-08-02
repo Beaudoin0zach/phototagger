@@ -137,19 +137,33 @@ def photos_done(run_dir: Path) -> int:
 
 
 def main() -> int:
+    usage = (
+        "usage: run_library_batches.py RUN_DIRECTORY [BATCH_SIZE] "
+        "[--stop-after=N] [--only-extensions=CR2,CR3] [--only-filenames=DJI,GOPR]"
+    )
+    known_flags = {"--stop-after", "--only-extensions", "--only-filenames"}
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    flags = {a.split("=")[0]: a.split("=", 1)[-1] for a in sys.argv[1:] if a.startswith("--")}
+    flags = {}
+    for raw in (a for a in sys.argv[1:] if a.startswith("--")):
+        # Require the = form: "--stop-after 300" would silently parse the flag
+        # name as its own value and then crash (or filter on nonsense).
+        name, sep, value = raw.partition("=")
+        if name not in known_flags or not sep or not value:
+            print(f"bad flag {raw!r}\n{usage}", file=sys.stderr)
+            return 2
+        flags[name] = value
     if len(args) not in (1, 2):
-        print(
-            "usage: run_library_batches.py RUN_DIRECTORY [BATCH_SIZE] "
-            "[--stop-after=N] [--only-extensions=CR2,CR3]",
-            file=sys.stderr,
-        )
+        print(usage, file=sys.stderr)
         return 2
     run_dir = Path(args[0]).resolve()
-    batch_size = int(args[1]) if len(args) == 2 else DEFAULT_BATCH_SIZE
-    stop_after = int(flags["--stop-after"]) if "--stop-after" in flags else None
+    try:
+        batch_size = int(args[1]) if len(args) == 2 else DEFAULT_BATCH_SIZE
+        stop_after = int(flags["--stop-after"]) if "--stop-after" in flags else None
+    except ValueError as error:
+        print(f"not a number: {error}\n{usage}", file=sys.stderr)
+        return 2
     only_ext = flags.get("--only-extensions")
+    only_names = flags.get("--only-filenames")
     run_file = run_dir / "run.json"
     if not run_file.exists():
         print(f"run metadata not found: {run_file}", file=sys.stderr)
@@ -226,7 +240,9 @@ def main() -> int:
                 str(run_dir),
                 "--batch-size",
                 str(batch_size),
-            ] + (["--only-extensions", only_ext] if only_ext else []),
+            ]
+            + (["--only-extensions", only_ext] if only_ext else [])
+            + (["--only-filenames", only_names] if only_names else []),
             check=False,
         )
         metadata = json.loads(run_file.read_text(encoding="utf-8"))

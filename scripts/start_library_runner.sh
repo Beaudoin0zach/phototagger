@@ -2,7 +2,7 @@
 set -eu
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: start_library_runner.sh RUN_DIRECTORY [BATCH_SIZE] [--stop-after=N]" >&2
+  echo "usage: start_library_runner.sh RUN_DIRECTORY [BATCH_SIZE] [--stop-after=N] [--only-extensions=...] [--only-filenames=...]" >&2
   exit 2
 fi
 

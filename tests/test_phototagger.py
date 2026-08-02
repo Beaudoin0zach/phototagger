@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import unittest
+import urllib.error
 from tempfile import TemporaryDirectory
 from unittest import mock
 from pathlib import Path
@@ -1270,7 +1271,9 @@ class ResumeSafetyTests(unittest.TestCase):
             ), mock.patch.object(
                 phototagger,
                 "library_item_by_id",
-                side_effect=RuntimeError("Photos automation timed out after 120s"),
+                side_effect=phototagger.PhotosTimeoutError(
+                    "Photos automation timed out after 120s"
+                ),
             ) as read_by_id:
                 result = phototagger.tag_command(self._resume_args(run_dir))
             # Distinct exit code tells the runner to restart Photos and resume.
@@ -1282,6 +1285,30 @@ class ResumeSafetyTests(unittest.TestCase):
             self.assertTrue(all(r["status"] == "error" for r in records))
             metadata = phototagger.load_run(run_dir)
             self.assertEqual(metadata["status"], "batch_errors")
+
+    def test_backend_stalls_do_not_trip_the_photos_circuit_breaker(self):
+        # A stalled Ollama/API also stringifies to "timed out"; only the
+        # PhotosTimeoutError TYPE may count toward the hang breaker, or the
+        # runner force-restarts Photos for a problem Photos doesn't have.
+        with TemporaryDirectory() as temp:
+            manifest_ids = tuple(f"p{i}" for i in range(1, 21))
+            run_dir = self._library_run_dir(temp, manifest_ids=manifest_ids)
+            with mock.patch.object(
+                phototagger, "library_count", return_value=20
+            ), mock.patch.object(
+                phototagger,
+                "library_item_by_id",
+                side_effect=RuntimeError(
+                    "Ollama request failed: The read operation timed out"
+                ),
+            ) as read_by_id:
+                result = phototagger.tag_command(self._resume_args(run_dir))
+            # Every item errors, but the batch runs to completion with plain
+            # exit 1 — no Photos-hang signal, no early stop.
+            self.assertEqual(result, 1)
+            self.assertEqual(read_by_id.call_count, 20)
+            records = phototagger.read_jsonl(run_dir / "results.jsonl")
+            self.assertTrue(all(r["status"] == "error" for r in records))
 
     def test_verify_phase_infrastructure_failure_saves_batch_errors_instead_of_crashing(
         self,
@@ -1364,6 +1391,47 @@ class ExtensionFilterTests(unittest.TestCase):
         attempts = {"a": phototagger.MAX_ERROR_ATTEMPTS, "b": 1}
         got = phototagger.pending_items(items, latest, None, attempts)
         self.assertEqual([i.identifier for i in got], ["b"])
+
+    def test_error_attempts_count_consecutive_not_lifetime(self):
+        # A success wipes the streak: environmental bursts (disk-full days,
+        # API 429 storms) must not spend a photo's permanent exclusion budget.
+        records = [
+            {"photo_id": "a", "status": "error"},
+            {"photo_id": "a", "status": "error"},
+            {"photo_id": "a", "status": "applied"},
+            {"photo_id": "a", "status": "error"},
+            {"photo_id": "b", "status": "error"},
+            {"photo_id": "b", "status": "error"},
+        ]
+        counts = phototagger.error_attempts_by_photo(records)
+        self.assertEqual(counts["a"], 1)
+        self.assertEqual(counts["b"], 2)
+
+    def test_error_attempts_ignore_write_pending_journal_records(self):
+        # write-pending is journaled intent BEFORE each write attempt; if it
+        # reset the streak, a photo failing at the write step would alternate
+        # write-pending/error forever and never exhaust its budget.
+        records = []
+        for _ in range(phototagger.MAX_ERROR_ATTEMPTS):
+            records.append({"photo_id": "a", "status": "write-pending"})
+            records.append({"photo_id": "a", "status": "error"})
+        counts = phototagger.error_attempts_by_photo(records)
+        self.assertEqual(counts["a"], phototagger.MAX_ERROR_ATTEMPTS)
+
+    def test_apply_resume_reopens_dry_run_review_records(self):
+        # Resuming a dry-run directory with --apply used to report "complete"
+        # having written nothing — review satisfied pending. Under apply the
+        # review records must count as pending again.
+        items = [make_item("a"), make_item("b")]
+        latest = {
+            "a": {"photo_id": "a", "status": "review"},
+            "b": {"photo_id": "b", "status": "applied"},
+        }
+        applying = phototagger.pending_items(items, latest, apply_changes=True)
+        self.assertEqual([i.identifier for i in applying], ["a"])
+        # Without --apply a review record still counts as done.
+        dry = phototagger.pending_items(items, latest, apply_changes=False)
+        self.assertEqual(dry, [])
 
     def test_matches_filenames_is_case_insensitive_substring(self):
         # One needle catches both drone naming shapes, which is the point.
@@ -1472,6 +1540,80 @@ class AppleScriptRetryTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 phototagger.run_applescript("inventory_library_batch.applescript", retries=3)
         self.assertEqual(run_command.call_count, 4)
+
+    def test_exhausted_hangs_carry_the_photos_timeout_type(self):
+        # The hang circuit breaker keys on the exception TYPE — a stalled
+        # backend also stringifies to "timed out", and the old substring match
+        # made an API stall force-restart Photos.
+        hang = subprocess.TimeoutExpired(cmd=["osascript"], timeout=600)
+        with mock.patch.object(
+            phototagger, "run_command", side_effect=[hang]
+        ), mock.patch.object(phototagger.time, "sleep"):
+            with self.assertRaises(phototagger.PhotosTimeoutError):
+                phototagger.run_applescript("library_count.applescript", retries=0)
+        # -1712 exhausted is Photos reporting its own AppleEvent timeout — the
+        # same wedged signature, same type.
+        with mock.patch.object(
+            phototagger, "run_command", side_effect=[self._timeout_error()]
+        ), mock.patch.object(phototagger.time, "sleep"):
+            with self.assertRaises(phototagger.PhotosTimeoutError):
+                phototagger.run_applescript("library_count.applescript", retries=0)
+        # A real script error is NOT a hang, even after retries exhaust.
+        wrong_id = subprocess.CalledProcessError(
+            1, ["osascript"], output="", stderr="Expected one media item with id: X"
+        )
+        with mock.patch.object(phototagger, "run_command", side_effect=[wrong_id]):
+            with self.assertRaises(RuntimeError) as caught:
+                phototagger.run_applescript("set_keywords.applescript", retries=0)
+        self.assertNotIsInstance(caught.exception, phototagger.PhotosTimeoutError)
+
+
+class TransientApiRetryTests(unittest.TestCase):
+    def _http_error(self, code):
+        import io
+
+        return urllib.error.HTTPError(
+            "https://api.example/v1", code, "err", hdrs=None, fp=io.BytesIO(b"{}")
+        )
+
+    def _response(self, payload):
+        response = mock.MagicMock()
+        response.__enter__.return_value = io_bytes = mock.Mock()
+        io_bytes.read.return_value = json.dumps(payload).encode()
+        return response
+
+    def test_rate_limit_retries_then_succeeds(self):
+        ok = mock.MagicMock()
+        ok.__enter__.return_value.read.return_value = b'{"ok": true}'
+        with mock.patch.object(
+            phototagger.urllib.request,
+            "urlopen",
+            side_effect=[self._http_error(429), self._http_error(503), ok],
+        ) as urlopen, mock.patch.object(phototagger.time, "sleep") as sleep:
+            result = phototagger.urlopen_json_with_retry(
+                mock.Mock(), timeout=30
+            )
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [5, 20])
+
+    def test_auth_errors_fail_fast(self):
+        # Retrying a bad key just delays a clear message.
+        with mock.patch.object(
+            phototagger.urllib.request, "urlopen", side_effect=[self._http_error(401)]
+        ) as urlopen:
+            with self.assertRaises(urllib.error.HTTPError):
+                phototagger.urlopen_json_with_retry(mock.Mock(), timeout=30)
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_connection_failures_retry_then_raise(self):
+        blip = urllib.error.URLError("connection reset")
+        with mock.patch.object(
+            phototagger.urllib.request, "urlopen", side_effect=[blip, blip, blip]
+        ) as urlopen, mock.patch.object(phototagger.time, "sleep"):
+            with self.assertRaises(urllib.error.URLError):
+                phototagger.urlopen_json_with_retry(mock.Mock(), timeout=30)
+        self.assertEqual(urlopen.call_count, 3)
 
 
 class RollbackTests(unittest.TestCase):
