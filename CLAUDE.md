@@ -30,9 +30,12 @@ python3 -m pytest tests/           # or: python3 tests/test_phototagger.py
 - Reconstructed tool; original source was unrecoverable (see `RECOVERY_NOTES.md`).
 - **RAW archive complete.** The whole-library run `runs/20260715-193432-Photos-Library/`
   finished its `--only-extensions=CR2` pass: 9,554 of 9,567 CR2 tagged (11
-  not-found, 2 unrecoverable). 23,195 of 77,753 manifest photos have durable
-  records. The run is **parked** (STOP in place); ~54.5k older JPG/HEIC remain
-  pending — resume without the filter to continue. The iMac front is tagging
+  not-found, 2 unrecoverable). As of 2026-08-02, 23,282 of 77,753 manifest
+  photos have durable records and the true remaining backlog is **54,692** —
+  53,491 stills plus **1,201 videos**, which now qualify since video support
+  landed. The run is **parked** (STOP in place); resume without the filter to
+  continue, but see the disk-space section first: videos download full
+  originals and the drone clips measured ~570 MB each. The iMac front is tagging
   HEIC ascending; its keywords sync via iCloud but its records stay device-local.
 - **Videos are tagged now** (2026-08-02): ffmpeg extracts one frame 10% into the
   clip and that frame runs through the normal classifier; everything downstream
@@ -57,9 +60,14 @@ python3 -m pytest tests/           # or: python3 tests/test_phototagger.py
 - **Drone media is tagged.** All 54 DJI stills and 14 DJI videos carry a `Drone`
   keyword plus descriptive tags. `--only-filenames=SUBSTR` (mirrors
   `--only-extensions`, same non-destructive semantics) is how they were scoped.
-- A completed **bring-your-own-API backend** (OpenAI-compatible adapter,
-  Keychain creds, `test-backend` subcommand) sits unmerged on
-  `origin/claude/angry-jang-97cca4` awaiting review.
+- **Four backends** since the bring-your-own-API merge (2026-08-02, was unmerged
+  on `claude/angry-jang-97cca4` since 07-28): `ollama` (default, local Gemma),
+  `openai-compatible` (one adapter for OpenAI/OpenRouter/Groq/Together/
+  DeepInfra/LM Studio/vLLM and Ollama's own `/v1`), `anthropic`, and `apple`
+  (local Vision). Keys live in the macOS Keychain, never a plaintext file.
+  **Run `test-backend` before any bulk run** on a new provider/model/key — it
+  costs one API call and touches nothing in Photos. Note `openai-compatible`
+  and `anthropic` send photos to a third party; the other two do not.
 - **Library traversal is manifest + id-based** (v5 runs): a one-time positional
   sweep records every photo id into `run_dir/manifest.jsonl`; all subsequent
   reads/writes address photos purely by id (`media item id ...`, ~0.13s at any

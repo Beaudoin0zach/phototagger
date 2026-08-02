@@ -66,30 +66,44 @@ print(f"last invocation: applied={m.get('applied_this_invocation')} errors={m.ge
 PY
 ```
 
-### This number is NOT the run's completion percentage — do not report it as one
+### This number counts only what THIS machine processed
 
-It counts only photos **this machine** has a record for in `results.jsonl`. The
-tool's own pending calculation also treats a photo as complete when it already
-carries generated keywords in Photos — including keywords the *other* machine
-applied, which arrive here by iCloud sync. So the two numbers diverge widely and
-both are correct:
+It counts photos this machine has a record for in `results.jsonl`. That is a
+real limit worth stating when reporting — the iMac's ascending front keeps its
+records locally, so its work is invisible here even though its keywords arrive
+by iCloud sync.
 
-| number | where to read it | what it means |
-|---|---|---|
-| `N of M already complete` | the `APPLY BATCH:` line in `runner.log` | what the tool will actually skip — **this is the completion figure** |
-| the script above | `results.jsonl` | photos this machine personally classified |
+**Corrected 2026-08-02 — the previous guidance here was wrong.** It claimed the
+tool's pending calculation also counts photos that already carry generated
+keywords in Photos, including the other machine's, and it therefore told you to
+read completion off the runner log's `N of M already complete` instead. Both
+claims were false:
 
-Measured 2026-07-28 on the MacBook run: the script reported **15,548 (20%)**
-while the runner log's own line read **70,084 of 77,753 already complete (90%)**.
-Nothing was wrong — the iMac's ascending front had covered the difference and
-iCloud had synced it. Reporting the 20% would have looked like a stalled run
-that had lost four days of work.
+- `pending_items()` derives "completed" **solely** from `results.jsonl` statuses.
+  It never inspects Photos for existing keywords. The tool has no cross-machine
+  visibility of any kind, so no number it prints can reflect the iMac's work.
+- The worked example — the script reporting 15,548 (20%) against the runner log's
+  **70,084 of 77,753 already complete (90%)** on 2026-07-28 — was not iCloud sync.
+  It was a scope bug: that line subtracted the *filtered* pending set (CR2 only)
+  from the *unfiltered* manifest. 77,753 − 70,084 = 7,669 was simply the CR2
+  photos still pending mid-pass. True coverage that day was ~17k, not 70k.
 
-**So always read the completion figure off the newest `APPLY BATCH:` line:**
+The bug was fixed 2026-08-02 (both the `APPLY BATCH:` header and the
+`Library progress:` line now use the unfiltered backlog), so the runner log is
+trustworthy again — but never treat a suspiciously high completion figure as
+good news. This project has now produced two false coverage claims: this one and
+the positional-cursor sweep that showed 79% of a "covered" range had never been
+processed.
+
+**Cross-check two independent sources before reporting any percentage:**
 
 ```bash
-grep "APPLY BATCH:" "$run/runner.log" | tail -1
+grep "APPLY BATCH:" "$run/runner.log" | tail -1   # tool's own view
+# plus the results.jsonl script above — they should now broadly agree.
 ```
+
+If they still diverge widely, that is a bug to investigate, not a sync artifact
+to explain away.
 
 `run.json` `status` values and what they mean:
 
