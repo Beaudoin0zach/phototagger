@@ -34,6 +34,29 @@ python3 -m pytest tests/           # or: python3 tests/test_phototagger.py
   records. The run is **parked** (STOP in place); ~54.5k older JPG/HEIC remain
   pending — resume without the filter to continue. The iMac front is tagging
   HEIC ascending; its keywords sync via iCloud but its records stay device-local.
+- **Videos are tagged now** (2026-08-02): ffmpeg extracts one frame 10% into the
+  clip and that frame runs through the normal classifier; everything downstream
+  is identical to a still. Device detection can't use EXIF — iPhone footage sets
+  `com.apple.quicktime.make`, while **DJI writes no maker at all** and is
+  recognized by its stream handler names (`DJI.AVC`). A truncated clip (missing
+  `moov` atom) makes ffmpeg exit 0 having written nothing, so the extractor
+  checks the file on disk, not the return code. ffmpeg/ffprobe are now
+  dependencies for video runs only.
+- **`skipped-unsupported` is not permanent.** It is not a retry status, so the
+  202 movies skipped by earlier runs would have stayed untagged forever after
+  video support landed. `pending_items` now keys that exclusion on the *current*
+  supported extension set, re-opening them automatically. Any future type
+  addition behaves the same way — don't "fix" this by hand-editing records.
+- **Printed coverage counts were wrong with a filter** (fixed 2026-08-02). Both
+  the batch header and `Library progress:` subtracted the *filtered* pending set
+  from the *unfiltered* manifest, so a 54-photo filtered batch printed
+  "77753 of 77753" while ~54.5k photos had never been processed. `run.json` was
+  always correct; only the display lied. Given this project already shipped one
+  false coverage claim (see the id-based traversal note below), treat any
+  progress number that looks suspiciously complete as a bug until proven.
+- **Drone media is tagged.** All 54 DJI stills and 14 DJI videos carry a `Drone`
+  keyword plus descriptive tags. `--only-filenames=SUBSTR` (mirrors
+  `--only-extensions`, same non-destructive semantics) is how they were scoped.
 - A completed **bring-your-own-API backend** (OpenAI-compatible adapter,
   Keychain creds, `test-backend` subcommand) sits unmerged on
   `origin/claude/angry-jang-97cca4` awaiting review.
