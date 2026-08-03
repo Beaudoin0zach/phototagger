@@ -26,17 +26,20 @@ python3 -m pytest tests/           # or: python3 tests/test_phototagger.py
 - Photos is only ever accessed through its scripting interface; existing keywords are preserved.
 - Every applied run is reversible: `phototagger.py rollback --run runs/<run-id>`.
 
-## Current state (2026-07-31)
+## Current state (2026-08-03)
 - Reconstructed tool; original source was unrecoverable (see `RECOVERY_NOTES.md`).
-- **RAW archive complete.** The whole-library run `runs/20260715-193432-Photos-Library/`
-  finished its `--only-extensions=CR2` pass: 9,554 of 9,567 CR2 tagged (11
-  not-found, 2 unrecoverable). As of 2026-08-02, 23,282 of 77,753 manifest
-  photos have durable records and the true remaining backlog is **54,692** —
-  53,491 stills plus **1,201 videos**, which now qualify since video support
-  landed. The run is **parked** (STOP in place); resume without the filter to
-  continue, but see the disk-space section first: videos download full
-  originals and the drone clips measured ~570 MB each. The iMac front is tagging
-  HEIC ascending; its keywords sync via iCloud but its records stay device-local.
+- **RAW archive complete; video pass complete.** The whole-library run
+  `runs/20260715-193432-Photos-Library/` finished its `--only-extensions=CR2`
+  pass (9,554 of 9,567 tagged; 11 not-found, 2 unrecoverable) and, overnight
+  2026-08-02→03, its `--only-extensions=MP4,MOV,M4V,AVI` pass: **all 1,215
+  manifest videos applied, zero errors** — including the 202 once stuck as
+  `skipped-unsupported`. 24,262 of 77,753 manifest photos now have durable
+  records; the remaining backlog is **53,491 older JPG/HEIC stills**. The run
+  is **parked** (STOP in place, placed by the filter-exhaustion path); resume
+  without any filter to continue. The video pass drove disk to ~25 GB free —
+  let macOS evict the Photos cache (do NOT force-evict) before resuming. The
+  iMac front is tagging HEIC ascending; its keywords sync via iCloud but its
+  records stay device-local.
 - **Videos are tagged now** (2026-08-02): ffmpeg extracts one frame 10% into the
   clip and that frame runs through the normal classifier; everything downstream
   is identical to a still. Device detection can't use EXIF — iPhone footage sets
@@ -57,9 +60,16 @@ python3 -m pytest tests/           # or: python3 tests/test_phototagger.py
   always correct; only the display lied. Given this project already shipped one
   false coverage claim (see the id-based traversal note below), treat any
   progress number that looks suspiciously complete as a bug until proven.
-- **Drone media is tagged.** All 54 DJI stills and 14 DJI videos carry a `Drone`
-  keyword plus descriptive tags. `--only-filenames=SUBSTR` (mirrors
-  `--only-extensions`, same non-destructive semantics) is how they were scoped.
+- **Drone media is tagged — all 72 items.** The 54 DJI stills and 14 videos in
+  the manifest, plus 4 imported on 2026-08-02 (3 healthy orphans off the
+  Desktop and `DJI_0007_recovered.MP4`, 7:54 of footage rebuilt with untrunc
+  from a moov-less 2 GB file, donor DJI_0005). All carry `Drone` plus
+  descriptive tags. The imports are NOT in the whole-library manifest — the
+  manifest is fixed at build time — so they were tagged via the "DJI Imports"
+  album run (`runs/20260802-174724-DJI-Imports`, independently rollback-able).
+  Any future imports need the same album treatment or a fresh manifest.
+  `--only-filenames=SUBSTR` (mirrors `--only-extensions`, same non-destructive
+  semantics) is how the manifest DJI items were scoped.
 - **Four backends** since the bring-your-own-API merge (2026-08-02, was unmerged
   on `claude/angry-jang-97cca4` since 07-28): `ollama` (default, local Gemma),
   `openai-compatible` (one adapter for OpenAI/OpenRouter/Groq/Together/
