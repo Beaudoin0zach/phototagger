@@ -8,7 +8,7 @@ requires-python = ">=3.10"
 # External runtime dependencies are system tools, not pip installs:
 #   - macOS with Photos.app and Apple command-line developer tools (swiftc)
 #   - ImageMagick (`magick`) for HEIC decoding / auto-orientation
-#   - Ollama with the `gemma4:e4b-it-qat` model (recommended backend)
+#   - Ollama with the `gemma4:26b-a4b-it-qat` model (recommended backend)
 dependencies = []
 
 [project.scripts]

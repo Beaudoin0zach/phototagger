@@ -154,6 +154,17 @@ Where the space actually was, when this came up: a bloated **CoreSpotlight index
 `~/Library/Metadata/CoreSpotlight` before anything else, and restart
 `spotlightknowledged`/`corespotlightd` afterwards to release deleted-file handles.
 
+- **Model upgraded mid-run** (2026-08-16): the whole-library run switched from
+  `gemma4:e4b-it-qat` to `gemma4:26b-a4b-it-qat` at ~25,700 photos complete —
+  photos before that boundary carry the smaller model's blander vocabulary;
+  everything after gets the 26B's scene-level labels. Same family on purpose, to
+  minimize vocabulary drift. Throughput is unchanged (~20 s/photo; MoE, ~4B
+  active). The e4b was deleted from Ollama to free disk — deleting it is also
+  what finally triggered the lazy iCloud eviction that a parked run and 14 GB
+  free had failed to trigger for an hour. Resume reads the model from
+  `run.json`, so future model changes are: park (STOP), `test-backend` the new
+  model, edit `run.json`'s `model` field, resume.
+
 ## Resuming the library run
 ```bash
 cd ~/projects/phototagger
