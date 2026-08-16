@@ -2032,5 +2032,47 @@ class SanitizationTests(unittest.TestCase):
         self.assertEqual(values, ["green leaf"])
 
 
+class PaletteTests(unittest.TestCase):
+    HISTOGRAM = (
+        "          1171: (58,26,33) #3A1A21 srgb(58,26,33)\n"
+        "          1061: (86,36,45) #56242D srgb(86,36,45)\n"
+        "           606: (194,84,86) #C25456 srgb(194,84,86)\n"
+        "           512: (212,133,123) #D4857B srgb(212,133,123)\n"
+        "           746: (222,198,191) #DEC6BF srgb(222,198,191)\n"
+    )
+
+    def test_parse_color_histogram_sorts_and_normalizes(self):
+        swatches = phototagger.parse_color_histogram(self.HISTOGRAM)
+        self.assertEqual(len(swatches), 5)
+        self.assertEqual(swatches[0]["hex"], "#3A1A21")
+        self.assertEqual(swatches[-1]["hex"], "#D4857B")
+        self.assertAlmostEqual(sum(s["weight"] for s in swatches), 1.0, places=2)
+        self.assertAlmostEqual(swatches[0]["weight"], 1171 / 4096, places=4)
+
+    def test_parse_color_histogram_ties_break_on_hex(self):
+        text = "  10: (0,0,0) #000000 srgb\n  10: (255,255,255) #FFFFFF srgb\n"
+        swatches = phototagger.parse_color_histogram(text)
+        self.assertEqual([s["hex"] for s in swatches], ["#000000", "#FFFFFF"])
+
+    def test_parse_color_histogram_empty_and_garbage(self):
+        self.assertEqual(phototagger.parse_color_histogram(""), [])
+        self.assertEqual(phototagger.parse_color_histogram("not a histogram\n"), [])
+
+    def test_image_palette_failure_is_none(self):
+        with mock.patch.object(
+            phototagger,
+            "run_command",
+            side_effect=subprocess.CalledProcessError(1, ["magick"]),
+        ):
+            self.assertIsNone(phototagger.image_palette(Path("/nonexistent.jpg")))
+
+    def test_image_palette_shapes_result(self):
+        completed = subprocess.CompletedProcess(["magick"], 0, self.HISTOGRAM, "")
+        with mock.patch.object(phototagger, "run_command", return_value=completed):
+            palette = phototagger.image_palette(Path("/photo.jpg"))
+        self.assertEqual(palette["dominant"], "#3A1A21")
+        self.assertEqual(len(palette["swatches"]), 5)
+
+
 if __name__ == "__main__":
     unittest.main()

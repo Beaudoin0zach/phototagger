@@ -70,6 +70,16 @@ python3 -m pytest tests/           # or: python3 tests/test_phototagger.py
   Any future imports need the same album treatment or a fresh manifest.
   `--only-filenames=SUBSTR` (mirrors `--only-extensions`, same non-destructive
   semantics) is how the manifest DJI items were scoped.
+- **Color palettes are captured** (2026-08-16). Every tagged photo's record now
+  carries a `palette` field (dominant + 5 weighted hex swatches), computed via
+  ImageMagick from the same export the classifier consumes — fail-soft, so a
+  palette failure can never fail a photo (`image_palette` in `phototagger.py`).
+  The backlog was backfilled by `scripts/extract_colors.py`, which reads Photos
+  derivative thumbnails (read-only file access, no scripting interface, no
+  iCloud downloads) into `runs/<id>/colors.jsonl`: 76,700 of 77,753 manifest
+  photos covered; rerun the script anytime to retry the ~1k without a local
+  derivative. Join to manifest/results via `photo_id.split("/")[0]`. The
+  "Field Colors" artifact dashboard was built from this data.
 - **Four backends** since the bring-your-own-API merge (2026-08-02, was unmerged
   on `claude/angry-jang-97cca4` since 07-28): `ollama` (default, local Gemma),
   `openai-compatible` (one adapter for OpenAI/OpenRouter/Groq/Together/

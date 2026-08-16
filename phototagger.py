@@ -1008,6 +1008,57 @@ def image_bytes_for_ollama(image: Path) -> bytes:
         return compatible_image.read_bytes()
 
 
+def parse_color_histogram(text: str) -> list[dict[str, object]]:
+    """Parse `magick ... histogram:info:` output into weighted hex swatches."""
+    entries: list[tuple[int, str]] = []
+    for line in text.splitlines():
+        match = re.match(r"\s*(\d+):.*?#([0-9A-Fa-f]{6})", line)
+        if match:
+            entries.append((int(match.group(1)), "#" + match.group(2).upper()))
+    total = sum(count for count, _ in entries)
+    if not total:
+        return []
+    entries.sort(key=lambda entry: (-entry[0], entry[1]))
+    return [
+        {"hex": hex_value, "weight": round(count / total, 4)}
+        for count, hex_value in entries
+    ]
+
+
+def image_palette(image: Path, *, swatches: int = 5) -> dict[str, object] | None:
+    """Dominant-color swatches via ImageMagick quantization, or None.
+
+    Color is enrichment riding an export we already paid for; a palette
+    failure must never fail the photo's tagging, so every error maps to None.
+    """
+    try:
+        result = run_command(
+            [
+                "magick",
+                f"{image}[0]",
+                "-auto-orient",
+                "-resize",
+                "64x64!",
+                "-alpha",
+                "remove",
+                "-colors",
+                str(swatches),
+                "-depth",
+                "8",
+                "-format",
+                "%c",
+                "histogram:info:",
+            ],
+            timeout=120,
+        )
+        parsed = parse_color_histogram(result.stdout)
+    except Exception:
+        return None
+    if not parsed:
+        return None
+    return {"dominant": parsed[0]["hex"], "swatches": parsed}
+
+
 def classify(
     image: Path,
     *,
@@ -2337,6 +2388,7 @@ def run_tag_batch(
                     image_path, device = prepare_for_classification(
                         media_path, prefix=prefix
                     )
+                    palette = image_palette(image_path)
                     analysis = classify(
                         image_path,
                         backend=backend,
@@ -2357,6 +2409,9 @@ def run_tag_batch(
                         image_path, device = prepare_for_classification(
                             media_path, prefix=prefix
                         )
+                        # Palette reads pixels, so it must run while the temp
+                        # export still exists.
+                        palette = image_palette(image_path)
                         analysis = classify(
                             image_path,
                             backend=backend,
@@ -2388,6 +2443,7 @@ def run_tag_batch(
                         "determinations": determinations,
                         "generated_keywords": generated,
                         "device": device,
+                        "palette": palette,
                     }
                 )
                 if apply_changes and generated:
