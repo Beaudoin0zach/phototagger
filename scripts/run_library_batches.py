@@ -28,7 +28,13 @@ DEFAULT_BATCH_SIZE = 300  # comfortably under the observed ~350-450 hang thresho
 # long run consumes disk steadily. Below this, exports start returning zero
 # files and Photos eventually wedges (measured: 544 failures/day at 12 GB free,
 # 0 at 64 GB). Park the run rather than grind into that state.
-MIN_FREE_GB = 20
+# Default 20 GB is calibrated for ~30 MB RAW downloads. A small-file run
+# (e.g. --only-extensions=heic, ~2 MB each, ~200 MB per 100-photo batch) can
+# safely use a lower floor via PHOTOTAGGER_MIN_FREE_GB — the evictable iCloud
+# originals sit as purgeable space macOS reclaims under pressure, so df hovering
+# near the floor is not real exhaustion. Default unchanged, so RAW/full runs are
+# unaffected.
+MIN_FREE_GB = float(os.environ.get("PHOTOTAGGER_MIN_FREE_GB", "20"))
 # Mirrors phototagger.RETRY_STATUSES — a photo whose latest record has one of
 # these is still pending, so it must not count toward a --stop-after target.
 RETRY_STATUSES = {"error", "verify-failed", "write-pending"}
