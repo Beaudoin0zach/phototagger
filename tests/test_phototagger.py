@@ -2032,6 +2032,44 @@ class SanitizationTests(unittest.TestCase):
         self.assertEqual(values, ["green leaf"])
 
 
+class FolderKeywordTests(unittest.TestCase):
+    def test_ancestry_plus_album(self):
+        self.assertEqual(
+            phototagger.folder_album_keywords(["Europe", "France"], "Paris", {}),
+            ["Europe", "France", "Paris"],
+        )
+
+    def test_duplicate_album_and_folder_collapse(self):
+        self.assertEqual(
+            phototagger.folder_album_keywords(["Europe", "Italy"], "Italy", {}),
+            ["Europe", "Italy"],
+        )
+
+    def test_renames_and_trimming(self):
+        self.assertEqual(
+            phototagger.folder_album_keywords(
+                ["US "], " New Hamspire ", {"New Hamspire": "New Hampshire"}
+            ),
+            ["US", "New Hampshire"],
+        )
+
+    def test_untitled_album_contributes_nothing(self):
+        self.assertEqual(
+            phototagger.folder_album_keywords(
+                ["US", "Colorado"], "Untitled Album", {}
+            ),
+            ["US", "Colorado"],
+        )
+
+    def test_rename_collision_dedupes(self):
+        self.assertEqual(
+            phototagger.folder_album_keywords(
+                ["France"], "Versaille", {"Versaille": "France"}
+            ),
+            ["France"],
+        )
+
+
 class PaletteTests(unittest.TestCase):
     HISTOGRAM = (
         "          1171: (58,26,33) #3A1A21 srgb(58,26,33)\n"

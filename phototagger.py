@@ -1322,6 +1322,144 @@ def prepare_for_classification(media_path: Path, *, prefix: str) -> tuple[Path, 
     return media_path, device_keyword(media_path, prefix=prefix)
 
 
+def folder_album_keywords(
+    path_segments: Iterable[str],
+    album_name: str,
+    renames: dict[str, str],
+) -> list[str]:
+    """Location keywords for an album: its name plus every ancestor folder.
+
+    Segments are trimmed (Photos folder names can carry invisible trailing
+    spaces), renamed via the OLD=NEW map, case-insensitively deduplicated
+    (the "Italy" album inside the "Italy" folder yields one keyword), and
+    "Untitled Album" contributes nothing — its photos still receive the
+    ancestor folders' keywords.
+    """
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for raw in (*path_segments, album_name):
+        value = str(raw).strip()
+        value = renames.get(value, value)
+        key = value.casefold()
+        if not value or key in seen or key == "untitled album":
+            continue
+        seen.add(key)
+        keywords.append(value)
+    return keywords
+
+
+def tag_folder_command(args: argparse.Namespace) -> int:
+    renames: dict[str, str] = {}
+    for pair in args.rename or []:
+        old, sep, new = pair.partition("=")
+        if not sep or not old.strip() or not new.strip():
+            raise RuntimeError(f"--rename expects OLD=NEW, got {pair!r}")
+        renames[old.strip()] = new.strip()
+
+    listing = run_applescript(
+        "list_folder_albums.applescript", args.folder, timeout=900
+    )
+    albums: list[tuple[list[str], str, list[str]]] = []
+    for line in listing.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        path_text, album_name, ids_text = parts
+        segments = [s.strip() for s in path_text.split(" / ") if s.strip()]
+        ids = [i for i in ids_text.split(",") if i]
+        albums.append((segments, album_name, ids))
+    if not albums:
+        raise RuntimeError(
+            f"no albums found under a Photos folder named {args.folder!r} "
+            "(names are compared with surrounding whitespace trimmed)"
+        )
+
+    keywords_by_photo: dict[str, list[str]] = {}
+    for segments, album_name, ids in albums:
+        keywords = folder_album_keywords(segments, album_name, renames)
+        if not keywords:
+            continue
+        for photo_id in ids:
+            keywords_by_photo[photo_id] = merge_keywords(
+                keywords_by_photo.get(photo_id, []), keywords
+            )
+    print(
+        f"{len(albums)} albums under {args.folder!r}; "
+        f"{len(keywords_by_photo)} distinct photos to keyword"
+    )
+
+    run_dir = new_run_directory(Path(args.runs_dir).resolve(), args.folder)
+    metadata = {
+        "album": f"folder:{args.folder}",
+        "source": "library",
+        "apply": args.apply,
+        "command": "tag-folder",
+        "folder": args.folder,
+        "renames": renames,
+        "created_at": utc_now(),
+    }
+    save_run(run_dir, metadata)
+    applied = errors = not_found = 0
+    with run_lock(run_dir):
+        for index, (photo_id, keywords) in enumerate(
+            sorted(keywords_by_photo.items()), start=1
+        ):
+            record: dict[str, object] = {
+                "photo_id": photo_id,
+                "album": metadata["album"],
+                "source": "library",
+                "generated_keywords": keywords,
+                "timestamp": utc_now(),
+            }
+            if not args.apply:
+                append_jsonl(run_dir / "results.jsonl", {**record, "status": "review"})
+                continue
+            try:
+                # Same write-ahead journal as tag: intent is durable before
+                # the Photos mutation, so a crash mid-run retries idempotently.
+                append_jsonl(
+                    run_dir / "results.jsonl", {**record, "status": "write-pending"}
+                )
+                before, after = sync_library_keywords(photo_id, keywords)
+                record.update(
+                    {
+                        "keywords_before": before,
+                        "keywords_after": after,
+                        "status": "applied",
+                    }
+                )
+                applied += 1
+            except PhotoNotFoundError:
+                record["status"] = "not-found"
+                not_found += 1
+            except Exception as error:
+                record.update({"status": "error", "error": str(error)})
+                errors += 1
+                print(f"  ERROR {photo_id}: {error}", file=sys.stderr, flush=True)
+            append_jsonl(run_dir / "results.jsonl", record)
+            if index % 100 == 0 or index == len(keywords_by_photo):
+                print(f"[{index}/{len(keywords_by_photo)}]", flush=True)
+            time.sleep(0.05)  # stay polite to Photos while the library run tags
+        metadata["status"] = (
+            "review"
+            if not args.apply
+            else ("complete_with_errors" if errors else "complete")
+        )
+        metadata["completed_at"] = utc_now()
+        save_run(run_dir, metadata)
+    if args.apply:
+        print(
+            f"Applied {applied}; {not_found} not found; {errors} error(s). "
+            f"Rollback: ./phototagger.py rollback --run {run_dir}"
+        )
+    else:
+        print(
+            f"Dry run: {len(keywords_by_photo)} photos recorded in "
+            f"{run_dir / 'results.jsonl'}; re-run with --apply to write"
+        )
+    return 1 if errors else 0
+
+
 def rename_generated_keywords(
     current: Iterable[str],
     generated: Iterable[str],
@@ -3129,6 +3267,25 @@ def build_parser() -> argparse.ArgumentParser:
     test_backend.add_argument("--confidence", type=float, default=0.65)
     test_backend.add_argument("--prefix", default="")
 
+    tag_folder = subparsers.add_parser(
+        "tag-folder",
+        help="write a Photos folder's album names and ancestry as keywords "
+        "(e.g. location albums under a places folder)",
+    )
+    tag_folder.add_argument(
+        "--folder", required=True, help="Photos folder name (searched at any depth)"
+    )
+    tag_folder.add_argument(
+        "--apply", action="store_true", help="write keywords into Photos"
+    )
+    tag_folder.add_argument(
+        "--rename",
+        action="append",
+        metavar="OLD=NEW",
+        help="rewrite a folder/album name before keywording (repeatable)",
+    )
+    tag_folder.add_argument("--runs-dir", default="runs", help=argparse.SUPPRESS)
+
     rollback = subparsers.add_parser("rollback", help="restore keywords from an applied run")
     rollback.add_argument("--run", required=True)
 
@@ -3187,6 +3344,8 @@ def main() -> int:
             if not 0.0 <= args.confidence <= 1.0:
                 raise RuntimeError("--confidence must be between 0 and 1")
             return test_backend_command(args)
+        if args.command == "tag-folder":
+            return tag_folder_command(args)
         if args.command == "rollback":
             return rollback_command(args)
         if args.command == "coverage":
