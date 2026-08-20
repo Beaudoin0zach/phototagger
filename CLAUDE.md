@@ -165,6 +165,24 @@ Where the space actually was, when this came up: a bloated **CoreSpotlight index
   `run.json`, so future model changes are: park (STOP), `test-backend` the new
   model, edit `run.json`'s `model` field, resume.
 
+- **A launchd health check now supervises the runner** (2026-08-20). The runner
+  survives session end but nothing watched *it*: three separate stops went
+  unnoticed for two weeks, ~6 days (iMac), and 5.5 hours. Install with
+  `./scripts/install_health_check.sh <run-dir>` (`--uninstall` to remove); it
+  runs `scripts/health_check.py` every 5 minutes and restarts the runner only
+  when the stop looks accidental. It refuses to act on a `STOP` file, a
+  completed run, or a `NEEDS_ATTENTION` marker, and it backs off 15m/1h/3h
+  before giving up — a wedged Photos recovers with idle time, not retries.
+  Two traps found while building it, both worth not re-learning:
+  - **launchd kills a job's whole process group when the job exits**, so a
+    plain `nohup` runner died seconds after each health-check tick. The spawn
+    uses `start_new_session=True` to escape the job's group.
+  - **Killing a runner orphans its `tag --resume` child**, which keeps tagging
+    and keeps `command.lock`. A replacement runner cannot take that lock and
+    force-restarts Photos in a loop *while the orphan is mid-export*. The
+    health check therefore treats any live runner **or tagger** as "busy".
+    When stopping by hand, `pkill` both patterns.
+
 ## Resuming the library run
 ```bash
 cd ~/projects/phototagger
