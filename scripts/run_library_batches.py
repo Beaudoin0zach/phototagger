@@ -23,7 +23,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXIT_PHOTOS_HUNG = 75
-DEFAULT_BATCH_SIZE = 300  # comfortably under the observed ~350-450 hang threshold
+# Photos degrades with time-under-load, not photo count, so the safe batch size
+# depends on how slow the current model is. 300 was calibrated when a photo took
+# ~7s; at the 26B's ~17s/photo a 300-photo batch runs ~85 minutes and the hangs
+# cluster near its end. An explicit size wins; otherwise the run's own recorded
+# batch_size wins, so a size chosen once survives every later restart —
+# including the unattended ones the launchd health check performs.
+DEFAULT_BATCH_SIZE = 300
 # Every tagged photo pulls its iCloud original down and Photos keeps it, so a
 # long run consumes disk steadily. Below this, exports start returning zero
 # files and Photos eventually wedges (measured: 544 failures/day at 12 GB free,
@@ -163,8 +169,15 @@ def main() -> int:
         return 2
     run_dir = Path(args[0]).resolve()
     try:
-        batch_size = int(args[1]) if len(args) == 2 else DEFAULT_BATCH_SIZE
         stop_after = int(flags["--stop-after"]) if "--stop-after" in flags else None
+        if len(args) == 2:
+            batch_size = int(args[1])
+        else:
+            try:
+                recorded = json.loads((run_dir / "run.json").read_text()).get("batch_size")
+            except (OSError, json.JSONDecodeError):
+                recorded = None
+            batch_size = int(recorded) if recorded else DEFAULT_BATCH_SIZE
     except ValueError as error:
         print(f"not a number: {error}\n{usage}", file=sys.stderr)
         return 2
