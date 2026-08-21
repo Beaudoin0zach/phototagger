@@ -1689,8 +1689,24 @@ def remove_library_keywords(
 
 
 def library_item_by_id(identifier: str) -> PhotoItem | None:
-    """Read one library photo by id; None when the photo no longer exists."""
-    output = run_applescript("library_item_by_id.applescript", identifier, timeout=120)
+    """Read one library photo by id; None when the photo no longer exists.
+
+    Fails fast on purpose. A healthy answer takes ~0.2s (measured 0.15-0.21s
+    over the whole library), so the old 120s x 3-retry policy spent ~7 minutes
+    per unresponsive photo to buy almost nothing: of 837 timeouts, 807 (96.4%)
+    failed anyway after all three attempts. Meanwhile the retry that DOES work
+    is the pending queue — 2,771 of 2,782 photos that errored at least once
+    later succeeded on a subsequent batch.
+
+    So give up quickly and let the batch loop record a retryable error: 30s is
+    still 150x a normal answer, and one cheap retry absorbs a genuine blip
+    (e.g. Photos mid-restart). This also sharpens the runner's hang detection,
+    which trips after 8 consecutive errors — a real wedge is now recognized in
+    minutes instead of an hour.
+    """
+    output = run_applescript(
+        "library_item_by_id.applescript", identifier, timeout=30, retries=1
+    )
     if output == "NOT_FOUND":
         return None
     fields = output.split(FIELD_SEPARATOR)
