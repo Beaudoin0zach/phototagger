@@ -10,7 +10,7 @@ runner survives session end, but nobody was watching *it*.
 Run this from launchd every few minutes. It restarts the runner only when the
 stop looks accidental, and it never fights a stop that was meant:
 
-  * runner or tagger alive  -> work is happening, nothing to do
+  * runner or tagger alive  -> work is happening, unless it has stalled
   * STOP file present       -> deliberate pause (human or the disk guard)
   * run.json says complete  -> finished
   * NEEDS_ATTENTION present -> already gave up; a human must clear it
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -39,6 +40,16 @@ os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/
 # Attempt N waits BACKOFF_MINUTES[N] after the previous restart; past the end
 # of the list the runner is left alone for human eyes.
 BACKOFF_MINUTES = [15, 60, 180]
+
+# A live-but-wedged tagger is indistinguishable from a working one by process
+# liveness alone, and that blind spot cost ~12 hours of tagging on 2026-08-24:
+# the tagger stayed up, tagged nothing, and this script dutifully called it
+# busy. Progress is the real signal. The bar has to clear the runner's OWN
+# legitimate silences: it waits 10 then 20 minutes between no-progress batch
+# retries, and a failing batch itself takes ~2 minutes, so ~22 minutes of
+# quiet is normal. 45 gives that a 2x margin while still catching a true
+# wedge within the hour.
+STALL_MINUTES = 45
 
 
 def log(message: str) -> None:
@@ -78,6 +89,42 @@ def work_in_progress(run_dir: Path) -> bool:
     return any(target in line for line in found.stdout.splitlines())
 
 
+def stop_everything(run_dir: Path) -> int:
+    """Kill the runner AND its tagger child, for THIS run only.
+
+    Killing only the runner orphans the tagger, which keeps command.lock and
+    leaves the replacement runner force-restarting Photos in a loop against a
+    lock it can never take — so both must go.
+
+    Scoped by run directory rather than a blanket pkill: a blanket kill would
+    also take down a second run (or the other machine's, on a shared home) that
+    this supervisor knows nothing about.
+    """
+    target = str(run_dir.resolve())
+    try:
+        found = subprocess.run(
+            ["pgrep", "-fl", "run_library_batches.py|phototagger.py tag"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return 0
+    killed = 0
+    for line in found.stdout.splitlines():
+        pid, _, rest = line.partition(" ")
+        if target not in rest or not pid.isdigit():
+            continue
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+            killed += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+    if killed:
+        time.sleep(5)
+    return killed
+
+
 def read_state(path: Path) -> dict[str, object]:
     try:
         return json.loads(path.read_text())
@@ -105,9 +152,6 @@ def main() -> int:
         return 0  # already escalated; stay quiet until a human clears it
     if (run_dir / "STOP").exists():
         return 0  # deliberate pause — never override it
-    if work_in_progress(run_dir):
-        return 0
-
     try:
         status = str(json.loads((run_dir / "run.json").read_text()).get("status", ""))
     except (OSError, json.JSONDecodeError):
@@ -119,6 +163,24 @@ def main() -> int:
     state = read_state(state_path)
     results = run_dir / "results.jsonl"
     size = results.stat().st_size if results.exists() else 0
+
+    # Track progress on every tick, whether or not anything is running, so the
+    # stall clock is always current.
+    if size != state.get("last_seen_size"):
+        state["last_seen_size"] = size
+        state["last_progress_epoch"] = time.time()
+        write_state(state_path, state)
+    last_progress = float(state.get("last_progress_epoch", 0) or time.time())
+
+    if work_in_progress(run_dir):
+        stalled_minutes = (time.time() - last_progress) / 60
+        if stalled_minutes < STALL_MINUTES:
+            return 0  # genuinely working (or inside a normal backoff wait)
+        log(
+            f"tagging is alive but has written nothing for {stalled_minutes:.0f} "
+            "minutes; treating as wedged and replacing it"
+        )
+        stop_everything(run_dir)
     failures = int(state.get("consecutive_failures", 0))
     last_restart = float(state.get("last_restart_epoch", 0) or 0)
     size_at_restart = state.get("results_size_at_restart")
@@ -163,6 +225,9 @@ def main() -> int:
             "last_restart_epoch": time.time(),
             "last_restart_iso": datetime.now(timezone.utc).isoformat(),
             "results_size_at_restart": size,
+            # Give the fresh runner a full stall window before judging it.
+            "last_seen_size": size,
+            "last_progress_epoch": time.time(),
         },
     )
     return 0

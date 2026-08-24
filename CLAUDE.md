@@ -182,6 +182,15 @@ Where the space actually was, when this came up: a bloated **CoreSpotlight index
     force-restarts Photos in a loop *while the orphan is mid-export*. The
     health check therefore treats any live runner **or tagger** as "busy".
     When stopping by hand, `pkill` both patterns.
+  - **"Busy" must mean progressing, not merely alive** (learned 2026-08-24, at
+    the cost of ~12 hours). A tagger wedged on Photos stays up and writes
+    nothing, and the liveness-only check above called that busy and waited all
+    night. The check now also requires `results.jsonl` to grow: quiet for over
+    `STALL_MINUTES` (45) with something alive means wedged, so it kills the
+    run's runner and tagger and starts fresh. 45 is deliberate — the runner's
+    own no-progress backoff legitimately goes silent for ~22 minutes (10m then
+    20m waits plus a failing batch), so anything tighter kills healthy waits.
+    Kills are scoped by run directory, never a blanket `pkill`.
 
 ## Resuming the library run
 ```bash
