@@ -2712,7 +2712,16 @@ def run_tag_batch(
         if error_count:
             metadata["status"] = "batch_errors"
         else:
-            metadata["status"] = "batch_complete" if remaining > 0 else "complete"
+            # "complete" must mean every manifest photo reached a durable
+            # success. Photos that exhausted MAX_ERROR_ATTEMPTS are excluded
+            # from pending, so without this they vanish from the arithmetic
+            # and the run declares itself finished with unresolved photos —
+            # the same false-coverage shape this project has shipped twice.
+            if remaining > 0:
+                metadata["status"] = "batch_complete"
+            else:
+                metadata["status"] = "complete_with_errors" if gave_up else "complete"
+            metadata["gave_up_count"] = gave_up
         metadata["last_batch_size"] = len(pending)
         metadata["last_batch_photo_ids"] = [item.identifier for item in pending]
         metadata["last_batch_verified"] = apply_changes and not error_count

@@ -228,6 +228,16 @@ def main() -> int:
             )
             return 0
         metadata = json.loads(run_file.read_text(encoding="utf-8"))
+        if metadata.get("status") == "complete_with_errors":
+            # Terminal, but NOT success: every remaining photo exhausted its
+            # retry budget. Say so plainly rather than looping on work that
+            # can never be picked up, and never call this "complete".
+            gave_up = metadata.get("gave_up_count", "some")
+            log(
+                f"run finished with {gave_up} photo(s) unresolved after "
+                "repeated failures; run `coverage` to list them"
+            )
+            return 0
         if metadata.get("status") == "complete":
             log("whole-library run complete")
             return 0

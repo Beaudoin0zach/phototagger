@@ -2032,6 +2032,44 @@ class SanitizationTests(unittest.TestCase):
         self.assertEqual(values, ["green leaf"])
 
 
+class GaveUpCompletionTests(unittest.TestCase):
+    """A run must not call itself complete while photos remain unresolved.
+
+    Photos that exhaust MAX_ERROR_ATTEMPTS are excluded from pending, so they
+    disappear from the completion arithmetic — the same shape as the two false
+    coverage claims this project has already shipped.
+    """
+
+    def test_consecutive_errors_exhaust_the_budget(self):
+        records = [{"photo_id": "p", "status": "error"}] * phototagger.MAX_ERROR_ATTEMPTS
+        counts = phototagger.error_attempts_by_photo(records)
+        self.assertGreaterEqual(counts["p"], phototagger.MAX_ERROR_ATTEMPTS)
+
+    def test_a_success_resets_the_streak(self):
+        records = [
+            {"photo_id": "p", "status": "error"},
+            {"photo_id": "p", "status": "error"},
+            {"photo_id": "p", "status": "applied"},
+            {"photo_id": "p", "status": "error"},
+        ]
+        self.assertEqual(phototagger.error_attempts_by_photo(records)["p"], 1)
+
+    def test_write_pending_does_not_reset_the_streak(self):
+        """Otherwise a photo failing at the write step never exhausts its budget."""
+        records = [
+            {"photo_id": "p", "status": "error"},
+            {"photo_id": "p", "status": "write-pending"},
+            {"photo_id": "p", "status": "error"},
+        ]
+        self.assertEqual(phototagger.error_attempts_by_photo(records)["p"], 2)
+
+    def test_exhausted_photos_are_withheld_from_pending(self):
+        items = [phototagger.PhotoItem(identifier="p", filename="a.jpg", keywords=[])]
+        attempts = {"p": phototagger.MAX_ERROR_ATTEMPTS}
+        pending = phototagger.pending_items(items, {}, None, attempts, apply_changes=True)
+        self.assertEqual(pending, [])
+
+
 class JournalSupersessionTests(unittest.TestCase):
     """An applied record must override the journal entry that preceded it.
 

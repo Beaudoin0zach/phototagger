@@ -16,7 +16,9 @@ conventions and safety rules specific to working in this repo.
 ## Build & test
 ```bash
 ./scripts/build.sh                 # compiles the Swift classifier
-python3 -m pytest tests/           # or: python3 tests/test_phototagger.py
+python3 -m pytest tests/           # or run each file directly:
+python3 tests/test_phototagger.py  #   library/tagging logic
+python3 tests/test_health_check.py #   the unattended launchd supervisor
 ```
 
 ## Safety rules (important)
@@ -215,6 +217,13 @@ Where the space actually was, when this came up: a bloated **CoreSpotlight index
     iCloud original crawls down. The old 45 was measured against the runner's
     10/20-minute backoff alone and would have killed slow-but-healthy exports.
 
+- **"Complete" must mean every photo succeeded** (2026-08-26). Photos that
+  exhaust `MAX_ERROR_ATTEMPTS` are withheld from pending, so they dropped out
+  of the completion arithmetic entirely: once only they remained, `remaining`
+  hit zero and the run declared itself `complete` with photos unresolved —
+  this project's third false-coverage shape. Such a run is now
+  `complete_with_errors`, carries `gave_up_count`, and the runner reports the
+  count instead of announcing completion. `coverage` already listed them.
 - **`NOT_FOUND` must mean gone, not unreachable** (2026-08-26). Both
   `library_item_by_id` and `export_library_item_by_id` caught *every* error
   from `media item id` and reported the photo missing — and `not-found` is a
