@@ -1415,8 +1415,16 @@ def tag_folder_command(args: argparse.Namespace) -> int:
                 append_jsonl(run_dir / "results.jsonl", {**record, "status": "review"})
                 continue
             try:
-                # Same write-ahead journal as tag: intent is durable before
-                # the Photos mutation, so a crash mid-run retries idempotently.
+                # Read the current keywords first so the journal can say which
+                # of these are actually new. Without it the entry claims every
+                # keyword as its own, and rollback deletes keywords it never
+                # added — this run once over-claimed 3,206 of them.
+                existing = library_item_by_id(photo_id)
+                if existing is None:
+                    raise PhotoNotFoundError(photo_id)
+                record["keywords_before"] = existing.keywords
+                # Write-ahead journal: intent is durable before the Photos
+                # mutation, so a crash mid-run retries idempotently.
                 append_jsonl(
                     run_dir / "results.jsonl", {**record, "status": "write-pending"}
                 )
@@ -2753,8 +2761,14 @@ def generated_tags_by_photo(
     - applied: keywords_after − keywords_before (the sync script's atomic
       read makes these authoritative), intersected with generated_keywords.
     - write-pending (no authoritative after): generated_keywords −
-      keywords_before. May over-claim only if the crash happened before the
-      write reached Photos, in which case removal is a no-op anyway.
+      keywords_before, but ONLY when no applied record for that photo follows
+      it. An applied record supersedes the journal entry that preceded it,
+      because the journal is written before Photos is consulted and therefore
+      cannot know which keywords already existed. Counting both over-claims:
+      `tag-folder` journals without any before-list at all, so its
+      write-pending records asserted that every location keyword was new, and
+      rolling back runs/20260817-090511-Around-the-World would have deleted
+      3,206 keywords it never added.
 
     A retried photo is handled naturally: attempt 1's record contributes the
     tag it added; attempt 2's before-list already contains it, so attempt 2
@@ -2765,6 +2779,10 @@ def generated_tags_by_photo(
     Photos — removal is idempotent either way.
     """
     union: dict[str, dict[str, object]] = {}
+    # Contributions from journal entries whose write has not yet been
+    # confirmed by an applied record. Superseded — and discarded — as soon as
+    # one arrives for that photo.
+    unconfirmed: dict[str, list[tuple[list[str], str]]] = {}
     for record in records:
         status = str(record.get("status", ""))
         if status not in {"applied", "write-pending"}:
@@ -2780,9 +2798,21 @@ def generated_tags_by_photo(
             ]
         else:
             added = [g for g in generated if g.casefold() not in before_fold]
+        photo_id = str(record.get("photo_id", ""))
+        # A journal entry that recorded no before-list at all cannot say which
+        # keywords were new — absent is not the same as empty. Defer it: if an
+        # applied record follows, its atomic read is authoritative; if none
+        # does, the write may still have landed, so it stays removable.
+        if status == "applied":
+            unconfirmed.pop(photo_id, None)
+        elif "keywords_before" not in record:
+            if added:
+                unconfirmed.setdefault(photo_id, []).append(
+                    (added, str(record.get("filename", "")))
+                )
+            continue
         if not added:
             continue
-        photo_id = str(record.get("photo_id", ""))
         entry = union.setdefault(
             photo_id,
             {
@@ -2795,6 +2825,17 @@ def generated_tags_by_photo(
             entry["generated_keywords"], added
         )
         entry["filename"] = record.get("filename", entry["filename"])
+    # Journal entries that never saw an applied record: the write may or may
+    # not have reached Photos, so they stay removable.
+    for photo_id, contributions in unconfirmed.items():
+        for added, filename in contributions:
+            entry = union.setdefault(
+                photo_id,
+                {"filename": filename, "generated_keywords": [], "photo_id": photo_id},
+            )
+            entry["generated_keywords"] = merge_keywords(
+                entry["generated_keywords"], added
+            )
     return {pid: e for pid, e in union.items() if e["generated_keywords"]}
 
 

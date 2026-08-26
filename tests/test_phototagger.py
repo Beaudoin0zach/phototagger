@@ -2032,6 +2032,53 @@ class SanitizationTests(unittest.TestCase):
         self.assertEqual(values, ["green leaf"])
 
 
+class JournalSupersessionTests(unittest.TestCase):
+    """An applied record must override the journal entry that preceded it.
+
+    tag-folder journals with no keywords_before at all, so counting both
+    records claimed every keyword was newly added — rolling back the
+    Around-the-World run would have deleted 3,206 pre-existing keywords.
+    """
+
+    def test_applied_supersedes_journal_without_before(self):
+        records = [
+            {"photo_id": "P", "status": "write-pending",
+             "generated_keywords": ["Italy", "Rome"]},
+            {"photo_id": "P", "status": "applied",
+             "generated_keywords": ["Italy", "Rome"],
+             "keywords_before": ["Rome"], "keywords_after": ["Rome", "Italy"]},
+        ]
+        result = phototagger.generated_tags_by_photo(records)
+        self.assertEqual(result["P"]["generated_keywords"], ["Italy"])
+
+    def test_unconfirmed_journal_stays_removable(self):
+        records = [
+            {"photo_id": "P", "status": "write-pending",
+             "generated_keywords": ["Italy"], "filename": "a.jpg"},
+        ]
+        result = phototagger.generated_tags_by_photo(records)
+        self.assertEqual(result["P"]["generated_keywords"], ["Italy"])
+
+    def test_retry_keeps_the_first_attempts_addition(self):
+        records = [
+            {"photo_id": "P", "status": "applied", "generated_keywords": ["Italy"],
+             "keywords_before": [], "keywords_after": ["Italy"]},
+            {"photo_id": "P", "status": "applied", "generated_keywords": ["Italy"],
+             "keywords_before": ["Italy"], "keywords_after": ["Italy"]},
+        ]
+        result = phototagger.generated_tags_by_photo(records)
+        self.assertEqual(result["P"]["generated_keywords"], ["Italy"])
+
+    def test_photo_whose_keywords_all_pre_existed_is_not_targeted(self):
+        records = [
+            {"photo_id": "P", "status": "write-pending",
+             "generated_keywords": ["Rome"]},
+            {"photo_id": "P", "status": "applied", "generated_keywords": ["Rome"],
+             "keywords_before": ["Rome"], "keywords_after": ["Rome"]},
+        ]
+        self.assertEqual(phototagger.generated_tags_by_photo(records), {})
+
+
 class FolderKeywordTests(unittest.TestCase):
     def test_ancestry_plus_album(self):
         self.assertEqual(
