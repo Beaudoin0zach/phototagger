@@ -40,8 +40,13 @@ on findFolder(candidate, targetName)
 	tell application "Photos"
 		if my trimmed(name of candidate) is targetName then return candidate
 		repeat with sub in folders of candidate
-			set result to my findFolder(sub, targetName)
-			if result is not missing value then return result
+			-- NEVER name this `result`: AppleScript reserves it and rewrites it
+			-- after every command, so the recursion returned whichever folder
+			-- the last enumeration happened to leave behind. Asking for
+			-- "Curated" silently returned its PARENT, and a build then treated
+			-- all 24,435 photographs as curated.
+			set foundFolder to my findFolder(sub, targetName)
+			if foundFolder is not missing value then return foundFolder
 		end repeat
 	end tell
 	return missing value
