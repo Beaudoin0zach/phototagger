@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -50,6 +51,14 @@ BACKOFF_MINUTES = [15, 60, 180]
 # quiet is normal. 45 gives that a 2x margin while still catching a true
 # wedge within the hour.
 STALL_MINUTES = 45
+
+# The runner parks itself below MIN_FREE_GB to protect Photos, and until now
+# every such park needed a human to clear STOP once space came back — the iMac
+# was losing a day at a time to exactly this. A disk park is a condition, not a
+# decision, so it can be cleared automatically once the condition passes. The
+# margin matters: resuming at the floor just re-parks on the next batch.
+DISK_STOP_RE = re.compile(r"only ([\d.]+) GB free \(< ([\d.]+) GB\); STOP placed")
+DISK_RESUME_MARGIN_GB = 6.0
 
 
 def log(message: str) -> None:
@@ -87,6 +96,36 @@ def work_in_progress(run_dir: Path) -> bool:
         return True
     target = str(run_dir.resolve())
     return any(target in line for line in found.stdout.splitlines())
+
+
+def free_gb() -> float:
+    stat = os.statvfs("/System/Volumes/Data")
+    return stat.f_bavail * stat.f_frsize / 1_073_741_824
+
+
+def disk_park_cleared(run_dir: Path) -> bool:
+    """True if STOP was placed by the disk guard and space has since recovered.
+
+    Only the runner's own low-disk message counts. A STOP a human placed, or
+    one from a --stop-after target, carries no such line and is left alone —
+    this must never override a deliberate pause.
+    """
+    log = run_dir / "runner.log"
+    if not log.exists():
+        return False
+    try:
+        with log.open(errors="replace") as handle:
+            tail = handle.readlines()[-40:]
+    except OSError:
+        return False
+    for line in reversed(tail):
+        match = DISK_STOP_RE.search(line)
+        if match:
+            floor = float(match.group(2))
+            return free_gb() >= floor + DISK_RESUME_MARGIN_GB
+        if "STOP file found" in line or "reached target" in line:
+            return False  # a deliberate pause is the most recent stop
+    return False
 
 
 def stop_everything(run_dir: Path) -> int:
@@ -151,7 +190,10 @@ def main() -> int:
     if attention.exists():
         return 0  # already escalated; stay quiet until a human clears it
     if (run_dir / "STOP").exists():
-        return 0  # deliberate pause — never override it
+        if not disk_park_cleared(run_dir):
+            return 0  # deliberate pause, or still short of space
+        log(f"disk recovered to {free_gb():.1f} GB; clearing the disk-guard STOP")
+        (run_dir / "STOP").unlink()
     try:
         status = str(json.loads((run_dir / "run.json").read_text()).get("status", ""))
     except (OSError, json.JSONDecodeError):

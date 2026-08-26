@@ -191,6 +191,14 @@ Where the space actually was, when this came up: a bloated **CoreSpotlight index
     own no-progress backoff legitimately goes silent for ~22 minutes (10m then
     20m waits plus a failing batch), so anything tighter kills healthy waits.
     Kills are scoped by run directory, never a blanket `pkill`.
+  - **A disk park clears itself** (2026-08-26). The runner's low-disk `STOP` is
+    a condition, not a decision, and every one used to need a human to clear
+    it — the iMac lost days to that. The health check now re-reads the
+    runner's own `only N GB free (< M GB); STOP placed` line and removes the
+    `STOP` once free space reaches the floor plus `DISK_RESUME_MARGIN_GB` (6);
+    resuming exactly at the floor just re-parks on the next batch. A `STOP`
+    without that line — a human pause, or a `--stop-after` target — is never
+    touched.
 
 ## Resuming the library run
 ```bash
