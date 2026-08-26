@@ -19,8 +19,18 @@ on run argv
     tell application "Photos"
         try
             set photoItem to media item id itemId
-        on error
-            return "NOT_FOUND"
+        on error errMsg number errNum
+            -- Only -1728 ("can't get media item id ...") means the photo is
+            -- genuinely gone. Every other failure is an automation problem —
+            -- an AppleEvent timeout, a dropped connection, Photos restarting
+            -- mid-call — and NOT_FOUND is a durable, non-retryable status, so
+            -- swallowing those silently dropped photos from the run forever.
+            -- Re-raise anything else and let the caller record a retryable
+            -- error instead.
+            if errNum is -1728 then
+                return "NOT_FOUND"
+            end if
+            error errMsg number errNum
         end try
         set itemFilename to filename of photoItem
         set itemDate to date of photoItem

@@ -45,12 +45,17 @@ BACKOFF_MINUTES = [15, 60, 180]
 # A live-but-wedged tagger is indistinguishable from a working one by process
 # liveness alone, and that blind spot cost ~12 hours of tagging on 2026-08-24:
 # the tagger stayed up, tagged nothing, and this script dutifully called it
-# busy. Progress is the real signal. The bar has to clear the runner's OWN
-# legitimate silences: it waits 10 then 20 minutes between no-progress batch
-# retries, and a failing batch itself takes ~2 minutes, so ~22 minutes of
-# quiet is normal. 45 gives that a 2x margin while still catching a true
-# wedge within the hour.
-STALL_MINUTES = 45
+# busy. Progress is the real signal.
+#
+# The bar must clear the longest silence the tool itself permits, which is a
+# single export, not the runner's backoff: exports run with timeout=1800 and
+# up to three retries (phototagger.run_applescript), so ~121 minutes of quiet
+# is legal while one iCloud original crawls down. An earlier value of 45 was
+# measured against the runner's 10/20-minute backoff alone and would kill a
+# slow-but-healthy export. 150 clears the real ceiling with margin; the
+# runner's own circuit breaker catches wedged Photos long before this does,
+# so this only needs to be the backstop for a wedged *runner*.
+STALL_MINUTES = 150
 
 # The runner parks itself below MIN_FREE_GB to protect Photos, and until now
 # every such park needed a human to clear STOP once space came back — the iMac
@@ -110,22 +115,40 @@ def disk_park_cleared(run_dir: Path) -> bool:
     one from a --stop-after target, carries no such line and is left alone —
     this must never override a deliberate pause.
     """
-    log = run_dir / "runner.log"
-    if not log.exists():
+    log_path = run_dir / "runner.log"
+    stop_path = run_dir / "STOP"
+    if not log_path.exists() or not stop_path.exists():
         return False
     try:
-        with log.open(errors="replace") as handle:
-            tail = handle.readlines()[-40:]
+        with log_path.open(errors="replace") as handle:
+            lines = [line for line in handle.readlines() if line.strip()]
     except OSError:
         return False
-    for line in reversed(tail):
-        match = DISK_STOP_RE.search(line)
-        if match:
-            floor = float(match.group(2))
-            return free_gb() >= floor + DISK_RESUME_MARGIN_GB
-        if "STOP file found" in line or "reached target" in line:
-            return False  # a deliberate pause is the most recent stop
-    return False
+    if not lines:
+        return False
+
+    # Only the LAST line counts. Scanning backwards let a stale disk-stop from
+    # hours earlier authorise clearing a STOP placed since for a different
+    # reason — filter exhaustion, or a person.
+    match = DISK_STOP_RE.search(lines[-1])
+    if not match:
+        return False
+
+    # The runner touches STOP and then logs, so its own STOP is never newer
+    # than the log. A STOP touched afterwards belongs to someone else, and log
+    # text cannot prove ownership on its own.
+    try:
+        # No tolerance: the runner touches STOP before it logs, so its own
+        # STOP is always older than the log. Any slack here lets a STOP placed
+        # moments later be mistaken for the runner's.
+        if stop_path.stat().st_mtime > log_path.stat().st_mtime:
+            log("STOP is newer than the runner's log; leaving it to its owner")
+            return False
+    except OSError:
+        return False
+
+    floor = float(match.group(2))
+    return free_gb() >= floor + DISK_RESUME_MARGIN_GB
 
 
 def stop_everything(run_dir: Path) -> int:
@@ -248,8 +271,33 @@ def main() -> int:
         return 0  # inside the backoff window; stay quiet
 
     log(f"nothing is tagging (attempt {failures + 1}); restarting {run_dir.name}")
+    # Reproduce the runner's original scope. Restarting bare would drop
+    # --only-extensions / --only-filenames / --stop-after and the batch size,
+    # turning a filtered or target-limited run into an unrestricted one.
+    extra_args: list[str] = []
+    args_file = run_dir / "runner.args"
+    if args_file.exists():
+        try:
+            extra_args = [
+                line.strip() for line in args_file.read_text().splitlines() if line.strip()
+            ]
+        except OSError:
+            extra_args = []
+    env = dict(os.environ)
+    env_file = run_dir / "runner.env"
+    if env_file.exists():
+        try:
+            for line in env_file.read_text().splitlines():
+                key, sep, value = line.strip().partition("=")
+                if sep and key:
+                    env[key] = value
+        except OSError:
+            pass
+    if extra_args:
+        log(f"restoring runner scope: {' '.join(extra_args)}")
     result = subprocess.run(
-        [str(ROOT / "scripts" / "start_library_runner.sh"), str(run_dir)],
+        [str(ROOT / "scripts" / "start_library_runner.sh"), str(run_dir), *extra_args],
+        env=env,
         capture_output=True,
         text=True,
         timeout=180,

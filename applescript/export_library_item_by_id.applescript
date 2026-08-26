@@ -11,8 +11,14 @@ on run argv
     tell application "Photos"
         try
             set photoItem to media item id itemId
-        on error
-            error "PHOTO_NOT_FOUND: " & itemId
+        on error errMsg number errNum
+            -- See library_item_by_id: only -1728 proves the photo is gone.
+            -- Any other error here is transient, and PHOTO_NOT_FOUND is
+            -- durable, so mapping them all to it lost photos permanently.
+            if errNum is -1728 then
+                error "PHOTO_NOT_FOUND: " & itemId
+            end if
+            error errMsg number errNum
         end try
         export {photoItem} to (POSIX file destinationPath) with using originals
     end tell

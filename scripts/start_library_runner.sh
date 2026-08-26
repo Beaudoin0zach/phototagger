@@ -38,6 +38,14 @@ if ! kill -0 "$runner_pid" 2>/dev/null; then
   exit 1
 fi
 echo "$runner_pid" > "$run_dir/runner.pid"
+# Record how this runner was invoked so an unattended restart can reproduce
+# its scope. Without it the health check restarts a filtered or target-limited
+# run as an unrestricted whole-library run, silently changing what it does.
+: > "$run_dir/runner.args"
+[[ -n "$batch_size" ]] && print -r -- "$batch_size" >> "$run_dir/runner.args"
+for arg in ${extra_args[@]:-}; do print -r -- "$arg" >> "$run_dir/runner.args"; done
+[[ -n "${PHOTOTAGGER_MIN_FREE_GB:-}" ]] && \
+  print -r -- "PHOTOTAGGER_MIN_FREE_GB=$PHOTOTAGGER_MIN_FREE_GB" > "$run_dir/runner.env"
 echo "Started PhotoTagger runner PID $runner_pid"
 echo "Log: $log_file"
 echo "Pause safely: touch '$run_dir/STOP'"
