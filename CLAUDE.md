@@ -198,7 +198,39 @@ Where the space actually was, when this came up: a bloated **CoreSpotlight index
     `STOP` once free space reaches the floor plus `DISK_RESUME_MARGIN_GB` (6);
     resuming exactly at the floor just re-parks on the next batch. A `STOP`
     without that line — a human pause, or a `--stop-after` target — is never
-    touched.
+    touched. Two audit findings hardened this (2026-08-26): only the log's
+    **last** line is consulted, since scanning backwards let a stale disk-stop
+    authorise clearing a `STOP` placed later for a different reason; and the
+    `STOP` must be **older than** `runner.log`, because the runner touches
+    `STOP` before it logs, so a newer one belongs to somebody else. Log text
+    alone cannot prove who owns a file.
+  - **Restarts replay the runner's scope.** `start_library_runner.sh` records
+    its arguments to `runner.args` (and `PHOTOTAGGER_MIN_FREE_GB` to
+    `runner.env`); the health check replays them. Restarting bare would drop
+    `--only-extensions` / `--only-filenames` / `--stop-after` and silently turn
+    a filtered run into an unrestricted whole-library one.
+  - **`STALL_MINUTES` is 150, not 45.** The bar has to clear the longest
+    silence the tool itself permits, which is a single export — `timeout=1800`
+    with up to three retries, so ~121 minutes of quiet is legal while one
+    iCloud original crawls down. The old 45 was measured against the runner's
+    10/20-minute backoff alone and would have killed slow-but-healthy exports.
+
+- **`NOT_FOUND` must mean gone, not unreachable** (2026-08-26). Both
+  `library_item_by_id` and `export_library_item_by_id` caught *every* error
+  from `media item id` and reported the photo missing — and `not-found` is a
+  durable, non-retryable status, so an AppleEvent timeout or a dropped
+  connection silently dropped photos from the run forever. Only error **-1728**
+  ("Can't get media item id ...") proves absence; everything else is re-raised
+  so the caller records a retryable error. Verified empirically against a bogus
+  id.
+- **Rollback trusts the applied record, not the journal** (2026-08-26). A
+  `write-pending` entry with **no** `keywords_before` key means unknown, not
+  empty — `tag-folder` wrote such entries, and reading them as empty made
+  rollback claim every keyword as its own. Rolling back the Around-the-World
+  run would have deleted **3,206 pre-existing keywords**. Such an entry is now
+  deferred to the applied record that follows it, and only counted alone when
+  none arrives. Note one audit called this path "100% verified, safe" — treat
+  a confident all-clear on a destructive path as unproven until recomputed.
 
 ## Resuming the library run
 ```bash
